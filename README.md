@@ -29,6 +29,7 @@ A distributed platform for orchestrating autonomous AI agents in enterprise envi
 - **Enterprise Security** — RBAC, audit logging, secrets management
 - **Multi-Cloud Support** — AWS, GCP, Azure, and on-premise deployments
 - **Observability** — Distributed tracing, metrics, and structured logging
+- **Release Safety** — Validated multi-architecture image manifest gates
 - **Plugin Architecture** — Extensible via custom plugins and middleware
 
 ## Quick Start
@@ -50,6 +51,9 @@ ao status --watch
 ## Documentation
 
 Full documentation at [docs.agent-orchestrator.io](https://docs.agent-orchestrator.io)
+
+Release operators can validate per-architecture image digests before manifest
+publication with [Multi-Arch Release Validation](docs/multiarch-release-validation.md).
 
 ## Contributing
 
