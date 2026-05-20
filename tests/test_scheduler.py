@@ -1,5 +1,5 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import PriorityQueue, QueueCapacityError, TaskScheduler
 
 
 class TestTaskScheduler:
@@ -35,6 +35,84 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_enqueue_rejects_when_queue_capacity_is_full(self):
+        scheduler = TaskScheduler(max_queue_size=1)
+        scheduler.enqueue({"type": "first"})
+
+        with pytest.raises(QueueCapacityError):
+            scheduler.enqueue({"type": "second"})
+
+        assert scheduler.queued_count() == 1
+
+    def test_capacity_is_released_after_complete(self):
+        scheduler = TaskScheduler(max_queue_size=1)
+        scheduler.enqueue({"type": "first"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task["type"] == "first"
+        assert scheduler.queued_count() == 1
+        assert scheduler.complete(task["id"])
+        assert scheduler.queued_count() == 0
+        scheduler.enqueue({"type": "second"})
+        assert scheduler.queued_count() == 1
+
+    def test_enqueue_rollback_releases_reserved_capacity(self, caplog):
+        class FailingQueue(PriorityQueue):
+            def push(self, item, priority=0):
+                raise RuntimeError("simulated durable enqueue failure")
+
+        scheduler = TaskScheduler(max_queue_size=1)
+        scheduler._queues["default"] = FailingQueue()
+
+        with pytest.raises(RuntimeError):
+            scheduler.enqueue({"type": "will-rollback"})
+
+        assert scheduler.queued_count() == 0
+        assert scheduler.metrics_snapshot()["enqueue_rollbacks"] == 1
+        assert scheduler.audit_events()[-1]["event"] == "enqueue_rollback"
+        assert "queue enqueue rolled back" in caplog.text
+
+        scheduler._queues["default"] = PriorityQueue()
+        task_id = scheduler.enqueue({"type": "after-rollback"})
+
+        assert task_id is not None
+        assert scheduler.queued_count() == 1
+
+    def test_retry_preserves_task_id_and_counts_retries(self):
+        scheduler = TaskScheduler(max_queue_size=1)
+        task_id = scheduler.enqueue({"type": "retry-me"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.fail(task["id"])
+        retried = asyncio.run(scheduler.dequeue())
+        assert retried["id"] == task_id
+        assert retried["retries"] == 1
+
+    def test_retry_rollback_restores_in_flight_task_and_capacity(self):
+        class FailingQueue(PriorityQueue):
+            def push(self, item, priority=0):
+                raise RuntimeError("simulated retry enqueue failure")
+
+        scheduler = TaskScheduler(max_queue_size=1)
+        task_id = scheduler.enqueue({"type": "retry-me"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        scheduler._queues["default"] = FailingQueue()
+
+        with pytest.raises(RuntimeError):
+            scheduler.fail(task["id"])
+
+        assert scheduler.queued_count() == 1
+        assert scheduler.metrics_snapshot()["retry_rollbacks"] == 1
+        assert scheduler.audit_events()[-1]["event"] == "retry_rollback"
+        assert scheduler.complete(task_id)
+        assert scheduler.queued_count() == 0
 
 # 2019-01-09T19:07:03 update
 
