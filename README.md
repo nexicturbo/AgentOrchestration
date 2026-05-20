@@ -29,6 +29,7 @@ A distributed platform for orchestrating autonomous AI agents in enterprise envi
 - **Enterprise Security** — RBAC, audit logging, secrets management
 - **Multi-Cloud Support** — AWS, GCP, Azure, and on-premise deployments
 - **Observability** — Distributed tracing, metrics, and structured logging
+- **Metrics Safety** — Deploy-time label cardinality checks for observability cost control
 - **Plugin Architecture** — Extensible via custom plugins and middleware
 
 ## Quick Start
@@ -46,6 +47,9 @@ ao deploy examples/hello-agent.yaml
 # View status
 ao status --watch
 ```
+
+Deployments validate metric label cardinality before rollout; see
+[Metrics Label Cardinality](docs/metrics-cardinality.md).
 
 ## Documentation
 
