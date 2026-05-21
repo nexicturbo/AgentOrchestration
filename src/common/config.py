@@ -2,7 +2,15 @@
 
 import os
 import json
+import re
 from typing import Any, Dict, Optional
+
+
+INTEGER_RE = re.compile(r"^[+-]?\d+$")
+FLOAT_RE = re.compile(
+    r"^[+-]?(?:\d+\.\d*|\.\d+|\d+[eE][+-]?\d+|"
+    r"\d+\.\d*[eE][+-]?\d+|\.\d+[eE][+-]?\d+)$",
+)
 
 
 class Config:
@@ -21,7 +29,14 @@ class Config:
         for key, value in os.environ.items():
             if key.startswith(prefix):
                 config_key = key[len(prefix):].lower().replace("_", ".")
-                self._set_nested(config_key, value)
+                self._set_nested(config_key, self._coerce_env_value(value))
+
+    def _coerce_env_value(self, value: str) -> Any:
+        if INTEGER_RE.match(value):
+            return int(value)
+        if FLOAT_RE.match(value):
+            return float(value)
+        return value
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")

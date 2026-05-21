@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,30 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_numeric_env_overrides_are_coerced(self, monkeypatch):
+        monkeypatch.setenv("AO_APP_PORT", "8080")
+        monkeypatch.setenv("AO_LIMITS_TIMEOUT", "-30")
+        monkeypatch.setenv("AO_WORKER_RATIO", "0.75")
+        monkeypatch.setenv("AO_BACKOFF_FACTOR", "1e-3")
+
+        config = Config()
+
+        assert config.get("app.port") == 8080
+        assert config.get("limits.timeout") == -30
+        assert config.get("worker.ratio") == 0.75
+        assert config.get("backoff.factor") == 0.001
+
+    def test_env_overrides_preserve_non_numeric_strings(self, monkeypatch):
+        monkeypatch.setenv("AO_DATABASE_HOST", "db01")
+        monkeypatch.setenv("AO_RELEASE_VERSION", "1.2.3")
+        monkeypatch.setenv("AO_FEATURE_FLAG", "true")
+
+        config = Config()
+
+        assert config.get("database.host") == "db01"
+        assert config.get("release.version") == "1.2.3"
+        assert config.get("feature.flag") == "true"
 
 # 2019-02-01T18:58:35 update
 
