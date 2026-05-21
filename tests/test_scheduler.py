@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,84 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_recovery_defers_task_when_tenant_capacity_is_full(self):
+        scheduler = TaskScheduler(default_tenant_limit=1)
+        scheduler.enqueue({"type": "running", "tenant_id": "tenant-a"})
+        import asyncio
+        running = asyncio.run(scheduler.dequeue())
+        assert running["tenant_id"] == "tenant-a"
+
+        result = scheduler.recover_after_restart([
+            {"id": "stale-task", "type": "recovered", "tenant_id": "tenant-a"}
+        ])
+
+        assert result == {"queued": [], "deferred": ["stale-task"]}
+        assert scheduler.list_deferred_recovery()[0]["id"] == "stale-task"
+        assert (
+            scheduler.list_deferred_recovery()[0]["recovery_state"]
+            == "deferred"
+        )
+        assert scheduler.audit_records()[-1] == {
+            "event": "recovery_concurrency_decision",
+            "task_id": "stale-task",
+            "tenant_id": "tenant-a",
+            "decision": "deferred",
+            "active": 1,
+            "limit": 1,
+            "queue": "default",
+        }
+
+    def test_recovery_counts_already_queued_recovered_work_per_tenant(self):
+        scheduler = TaskScheduler(default_tenant_limit=1)
+
+        result = scheduler.recover_after_restart([
+            {"id": "first", "type": "recovered", "tenant_id": "tenant-a"},
+            {"id": "second", "type": "recovered", "tenant_id": "tenant-a"},
+        ])
+
+        assert result == {"queued": ["first"], "deferred": ["second"]}
+        assert scheduler.audit_records()[0]["decision"] == "queued"
+        assert scheduler.audit_records()[1]["decision"] == "deferred"
+        import asyncio
+        recovered = asyncio.run(scheduler.dequeue())
+        assert recovered["id"] == "first"
+        assert recovered["recovery_state"] == "queued"
+
+    def test_recovery_uses_custom_tenant_limit_without_payload_leakage(self):
+        scheduler = TaskScheduler(default_tenant_limit=1)
+        scheduler.set_tenant_limit("tenant-a", 2)
+        private_payload = {"secret": "do-not-log"}
+
+        result = scheduler.recover_after_restart([
+            {
+                "id": "allowed",
+                "type": "recovered",
+                "tenant_id": "tenant-a",
+                "payload": private_payload,
+            },
+            {
+                "id": "also-allowed",
+                "type": "recovered",
+                "tenant_id": "tenant-a",
+                "payload": private_payload,
+            },
+            {
+                "id": "blocked",
+                "type": "recovered",
+                "tenant_id": "tenant-a",
+                "payload": private_payload,
+            },
+        ])
+
+        assert result == {
+            "queued": ["allowed", "also-allowed"],
+            "deferred": ["blocked"],
+        }
+        assert all(
+            "payload" not in record
+            for record in scheduler.audit_records()
+        )
 
 # 2019-01-09T19:07:03 update
 

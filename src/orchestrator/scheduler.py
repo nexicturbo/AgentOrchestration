@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
 
@@ -31,13 +31,24 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, default_tenant_limit: int = 1):
+        if default_tenant_limit < 1:
+            raise ValueError("default_tenant_limit must be at least 1")
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._deferred_recovery: Dict[str, Dict] = {}
+        self._tenant_limits: Dict[str, int] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._default_tenant_limit = default_tenant_limit
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +59,103 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def enqueue_existing(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: Optional[int] = None,
+    ) -> str:
+        task.setdefault("id", str(uuid4()))
+        task.setdefault("enqueued_at", time.time())
+        task.setdefault("retries", 0)
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        queue_priority = (
+            task.get("priority", 0)
+            if priority is None
+            else priority
+        )
+        self._queues[queue].push(task, queue_priority)
+        return task["id"]
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    def set_tenant_limit(self, tenant_id: str, limit: int) -> None:
+        if limit < 1:
+            raise ValueError("tenant limit must be at least 1")
+        self._tenant_limits[tenant_id] = limit
+
+    def recover_after_restart(
+        self,
+        tasks: Iterable[Dict],
+        queue: str = "default",
+    ) -> Dict[str, List[str]]:
+        queued: List[str] = []
+        deferred: List[str] = []
+        tenant_usage = self._tenant_usage_snapshot()
+
+        for task in tasks:
+            task = dict(task)
+            task_id = task.setdefault("id", str(uuid4()))
+            tenant_id = task.get("tenant_id", "default")
+            limit = self._tenant_limits.get(
+                tenant_id,
+                self._default_tenant_limit,
+            )
+            active = tenant_usage[tenant_id]
+
+            if active >= limit:
+                task["recovery_state"] = "deferred"
+                task["deferred_reason"] = "tenant_concurrency_limit"
+                self._deferred_recovery[task_id] = task
+                deferred.append(task_id)
+                self._record_recovery_audit(
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    decision="deferred",
+                    active=active,
+                    limit=limit,
+                    queue=queue,
+                )
+                continue
+
+            task["recovery_state"] = "queued"
+            task["recovered_at"] = time.time()
+            self.enqueue_existing(task, queue, task.get("priority", 0))
+            tenant_usage[tenant_id] += 1
+            queued.append(task_id)
+            self._record_recovery_audit(
+                task_id=task_id,
+                tenant_id=tenant_id,
+                decision="queued",
+                active=active,
+                limit=limit,
+                queue=queue,
+            )
+
+        return {"queued": queued, "deferred": deferred}
+
+    def list_deferred_recovery(self) -> List[Dict]:
+        return list(self._deferred_recovery.values())
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -77,9 +178,44 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self.enqueue_existing(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                )
                 return True
         return False
+
+    def _tenant_usage_snapshot(self) -> Counter:
+        usage = Counter()
+        for task in self._in_flight.values():
+            usage[task.get("tenant_id", "default")] += 1
+        for queue in self._queues.values():
+            for _, _, task in queue._queue:
+                if task.get("recovery_state") == "queued":
+                    usage[task.get("tenant_id", "default")] += 1
+        return usage
+
+    def _record_recovery_audit(
+        self,
+        task_id: str,
+        tenant_id: str,
+        decision: str,
+        active: int,
+        limit: int,
+        queue: str,
+    ) -> None:
+        self._audit_records.append(
+            {
+                "event": "recovery_concurrency_decision",
+                "task_id": task_id,
+                "tenant_id": tenant_id,
+                "decision": decision,
+                "active": active,
+                "limit": limit,
+                "queue": queue,
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
