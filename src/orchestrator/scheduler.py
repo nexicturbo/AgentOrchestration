@@ -134,9 +134,19 @@ class TaskScheduler:
         tasks: Iterable[Dict],
         queue: str = "default",
     ) -> Dict[str, List[str]]:
-        result = {"accepted": [], "deferred": []}
+        result = {"accepted": [], "deferred": [], "skipped": []}
         for task in tasks:
             task_id = task.setdefault("id", str(uuid4()))
+            if task_id in self._in_flight:
+                result["skipped"].append(task_id)
+                self._record_audit(
+                    "skipped",
+                    task,
+                    "duplicate_recovery_task",
+                    queue,
+                )
+                continue
+
             if self._can_dispatch(task):
                 self._in_flight[task_id] = task
                 task["recovered_at"] = time.time()
@@ -148,6 +158,8 @@ class TaskScheduler:
                     queue,
                 )
             else:
+                task["recovery_state"] = "deferred"
+                task["deferred_reason"] = "tenant_concurrency_limit"
                 self._recovery_deferred[task_id] = task
                 result["deferred"].append(task_id)
                 self._record_audit(

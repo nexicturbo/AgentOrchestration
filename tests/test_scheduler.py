@@ -77,10 +77,16 @@ class TestTaskScheduler:
 
         result = scheduler.recover_in_flight(recovered)
 
-        assert result == {"accepted": ["run-1"], "deferred": ["run-2"]}
+        assert result == {
+            "accepted": ["run-1"],
+            "deferred": ["run-2"],
+            "skipped": [],
+        }
         assert scheduler._in_flight["run-1"] is recovered[0]
         assert scheduler._recovery_deferred["run-2"] is recovered[1]
         assert recovered[1]["state"] == "running"
+        assert recovered[1]["recovery_state"] == "deferred"
+        assert recovered[1]["deferred_reason"] == "tenant_concurrency_limit"
         assert "payload" not in scheduler.audit_log[-1]
         assert scheduler.audit_log[-1] == {
             "decision": "deferred",
@@ -89,6 +95,59 @@ class TestTaskScheduler:
             "tenant_id": "tenant-a",
             "tenant_in_flight": 1,
             "tenant_limit": 1,
+            "queue": "default",
+        }
+
+    def test_recovery_counts_existing_in_flight_tenant_capacity(self):
+        scheduler = TaskScheduler(max_concurrent_per_tenant=2)
+        scheduler._in_flight["active-1"] = {
+            "id": "active-1",
+            "type": "run",
+            "tenant_id": "tenant-a",
+            "state": "running",
+        }
+        recovered = [
+            {"id": "run-1", "type": "run", "tenant_id": "tenant-a"},
+            {"id": "run-2", "type": "run", "tenant_id": "tenant-a"},
+        ]
+
+        result = scheduler.recover_in_flight(recovered)
+
+        assert result == {
+            "accepted": ["run-1"],
+            "deferred": ["run-2"],
+            "skipped": [],
+        }
+        assert set(scheduler._in_flight) == {"active-1", "run-1"}
+        assert scheduler._recovery_deferred["run-2"] is recovered[1]
+        assert scheduler.audit_log[-1]["tenant_in_flight"] == 2
+
+    def test_recovery_skips_duplicate_in_flight_task_id(self):
+        scheduler = TaskScheduler(max_concurrent_per_tenant=2)
+        active = {
+            "id": "active-1",
+            "type": "run",
+            "tenant_id": "tenant-a",
+            "payload": {"secret": "do-not-copy"},
+        }
+        scheduler._in_flight["active-1"] = active
+
+        result = scheduler.recover_in_flight([dict(active)])
+
+        assert result == {
+            "accepted": [],
+            "deferred": [],
+            "skipped": ["active-1"],
+        }
+        assert scheduler._in_flight["active-1"] is active
+        assert scheduler._recovery_deferred == {}
+        assert scheduler.audit_log[-1] == {
+            "decision": "skipped",
+            "reason": "duplicate_recovery_task",
+            "task_id": "active-1",
+            "tenant_id": "tenant-a",
+            "tenant_in_flight": 1,
+            "tenant_limit": 2,
             "queue": "default",
         }
 
