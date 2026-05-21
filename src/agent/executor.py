@@ -5,15 +5,27 @@ import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
+from src.orchestrator.checkpoints import CheckpointRecord, CheckpointStore
+
 
 class AgentExecutor:
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(
+        self,
+        max_concurrent: int = 5,
+        checkpoint_store: Optional[CheckpointStore] = None,
+    ):
         self.max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self._checkpoints = checkpoint_store or CheckpointStore()
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -29,7 +41,13 @@ class AgentExecutor:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -45,6 +63,35 @@ class AgentExecutor:
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
 
+    def save_checkpoint(
+        self,
+        task: Dict[str, Any],
+        step_id: str,
+        payload: Any,
+        *,
+        attempt: Optional[int] = None,
+        digest: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> CheckpointRecord:
+        task_id = task.get("id")
+        if attempt is None:
+            attempt = int(task.get("attempt", task.get("retries", 0)))
+        return self._checkpoints.write(
+            task_id,
+            step_id,
+            attempt,
+            payload,
+            digest=digest,
+            metadata=metadata,
+        )
+
+    def resume_checkpoint(
+        self,
+        task: Dict[str, Any],
+        step_id: Optional[str] = None,
+    ) -> Optional[CheckpointRecord]:
+        return self._checkpoints.latest_for_task(task.get("id"), step_id)
+
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
         if task and not task.done():
@@ -56,7 +103,10 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
