@@ -4,6 +4,14 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from .artifact_retention import (
+    ArtifactRetentionError,
+    ArtifactRetentionPolicy,
+    ArtifactRetentionValidator,
+    CleanupSchedule,
+    retention_audit_event,
+)
+
 
 class StepStatus(Enum):
     PENDING = "pending"
@@ -14,7 +22,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -33,6 +47,9 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.revision = 0
+        self.cleanup_schedules: List[CleanupSchedule] = []
+        self.audit_log: List[Dict[str, object]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -46,6 +63,7 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._retention_validator = ArtifactRetentionValidator()
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -61,12 +79,79 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def schedule_artifact_cleanup(
+        self,
+        workflow_id: str,
+        policy: ArtifactRetentionPolicy,
+        expected_revision: Optional[int] = None,
+    ) -> CleanupSchedule:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            raise ArtifactRetentionError("workflow_not_found")
+
+        try:
+            self._validate_cleanup_request(
+                workflow,
+                policy,
+                expected_revision,
+            )
+        except ArtifactRetentionError as exc:
+            workflow.audit_log.append(
+                retention_audit_event(
+                    workflow_id=workflow.id,
+                    workflow_status=workflow.status.value,
+                    expected_revision=expected_revision,
+                    actual_revision=workflow.revision,
+                    policy_name=policy.name,
+                    decision="rejected",
+                    reason=exc.reason,
+                )
+            )
+            raise
+
+        schedule = CleanupSchedule(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            policy_name=policy.name,
+            run_after_seconds=policy.cleanup_after_seconds,
+            expected_revision=workflow.revision,
+        )
+        workflow.cleanup_schedules.append(schedule)
+        workflow.audit_log.append(
+            retention_audit_event(
+                workflow_id=workflow.id,
+                workflow_status=workflow.status.value,
+                expected_revision=expected_revision,
+                actual_revision=workflow.revision,
+                policy_name=policy.name,
+                decision="accepted",
+                reason="cleanup_scheduled",
+            )
+        )
+        return schedule
+
+    def _validate_cleanup_request(
+        self,
+        workflow: Workflow,
+        policy: ArtifactRetentionPolicy,
+        expected_revision: Optional[int],
+    ) -> None:
+        self._retention_validator.validate(policy)
+        if workflow.status is not StepStatus.COMPLETED:
+            raise ArtifactRetentionError("workflow_not_completed")
+        if (
+            expected_revision is not None
+            and expected_revision != workflow.revision
+        ):
+            raise ArtifactRetentionError("stale_workflow_revision")
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
         workflow.status = StepStatus.RUNNING
+        workflow.revision += 1
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
@@ -77,9 +162,11 @@ class WorkflowManager:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
                 workflow.status = StepStatus.FAILED
+                workflow.revision += 1
                 return False
 
         workflow.status = StepStatus.COMPLETED
+        workflow.revision += 1
         return True
 
 # 2019-03-27T19:58:07 update
