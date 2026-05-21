@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,142 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_scheduled_task_dequeues_after_delay(self):
+        self.scheduler.schedule({"type": "scheduled"}, delay=0)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["type"] == "scheduled"
+        assert task["lifecycle"] == "running"
+
+    def test_child_retry_after_parent_cancel_is_rejected(self):
+        parent_id = self.scheduler.enqueue({"type": "parent"})
+        task = {
+            "type": "child",
+            "parent_id": parent_id,
+            "attempt": 2,
+            "revision": 7,
+            "lifecycle": "running",
+            "parent_lifecycle": "cancelled",
+            "payload": {"secret": "do-not-copy"},
+        }
+        self.scheduler.enqueue(task)
+
+        import asyncio
+        parent = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.complete(parent["id"])
+        queued = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            queued["id"], expected_attempt=2, expected_revision=7
+        )
+        assert queued["retry_state"] == "rejected"
+        assert queued["retry_rejected_reason"] == "parent_cancelled"
+        audit = self.scheduler.retry_audit_log[-1]
+        assert audit["reason"] == "parent_cancelled"
+        assert (
+            self.scheduler.get_task_state(queued["id"])["lifecycle"]
+            == "cancelled"
+        )
+        assert "payload" not in self.scheduler.retry_audit_log[-1]
+
+    def test_stale_attempt_retry_is_rejected_without_requeue(self):
+        self.scheduler.enqueue({"type": "child", "attempt": 2, "revision": 3})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            task["id"], expected_attempt=1, expected_revision=3
+        )
+        assert task["retry_rejected_reason"] == "stale_attempt"
+        assert self.scheduler.retry_audit_log[-1]["decision"] == "rejected"
+        assert self.scheduler.complete(task["id"])
+
+    def test_cancelled_parent_registry_blocks_child_retry(self):
+        self.scheduler.cancel_parent("parent-1")
+        self.scheduler.enqueue({
+            "type": "child",
+            "parent_id": "parent-1",
+            "attempt": 1,
+            "revision": 1,
+        })
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            task["id"], expected_attempt=1, expected_revision=1
+        )
+        assert task["retry_rejected_reason"] == "parent_cancelled"
+        assert (
+            self.scheduler.get_task_state(task["id"])["lifecycle"]
+            == "cancelled"
+        )
+
+    def test_stale_revision_retry_is_rejected_without_requeue(self):
+        self.scheduler.enqueue({"type": "child", "attempt": 1, "revision": 4})
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(
+            task["id"], expected_attempt=1, expected_revision=3
+        )
+        assert task["retry_rejected_reason"] == "stale_revision"
+        assert self.scheduler.complete(task["id"])
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_stale_parent_revision_blocks_child_retry(self):
+        parent_id = self.scheduler.enqueue({
+            "type": "parent",
+            "attempt": 1,
+            "revision": 5,
+        })
+        self.scheduler.enqueue({
+            "type": "child",
+            "parent_id": parent_id,
+            "parent_attempt": 1,
+            "parent_revision": 4,
+        })
+
+        import asyncio
+        parent = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.complete(parent["id"])
+        child = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(child["id"])
+        assert child["retry_rejected_reason"] == "stale_parent_revision"
+        audit = self.scheduler.retry_audit_log[-1]
+        assert audit["reason"] == "stale_parent_revision"
+        assert self.scheduler.complete(child["id"])
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+    def test_child_retry_allowed_when_parent_revision_matches(self):
+        parent_id = self.scheduler.enqueue({
+            "type": "parent",
+            "attempt": 1,
+            "revision": 5,
+        })
+        self.scheduler.enqueue({
+            "type": "child",
+            "parent_id": parent_id,
+            "parent_attempt": 1,
+            "parent_revision": 5,
+        })
+
+        import asyncio
+        parent = asyncio.run(self.scheduler.dequeue())
+        assert self.scheduler.complete(parent["id"])
+        child = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(child["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == child["id"]
+        assert retried["attempt"] == 1
+        assert retried["revision"] == 1
 
 # 2019-01-09T19:07:03 update
 
