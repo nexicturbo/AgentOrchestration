@@ -2,21 +2,46 @@
 
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+from src.common.errors import AuthenticationError
+
+
+_MISSING_API_KEY = object()
+
 
 class OrchestratorClient:
-    def __init__(self, base_url: str = None, api_key: str = None):
-        self.base_url = base_url or os.getenv("AO_API_URL", "https://api.agent-orchestrator.io")
-        self.api_key = api_key or os.getenv("AO_API_KEY", "")
+    def __init__(self, base_url: str = None, api_key: Any = _MISSING_API_KEY):
+        self.base_url = base_url or os.getenv(
+            "AO_API_URL",
+            "https://api.agent-orchestrator.io",
+        )
+        self.api_key = self._resolve_api_key(api_key)
         self._session = None
+
+    @staticmethod
+    def _validate_api_key(api_key: Any, source: str) -> str:
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise AuthenticationError(
+                f"{source} must be configured as a non-blank API key"
+            )
+        return api_key.strip()
+
+    @classmethod
+    def _resolve_api_key(cls, api_key: Any) -> str:
+        if api_key is _MISSING_API_KEY:
+            return cls._validate_api_key(os.getenv("AO_API_KEY"), "AO_API_KEY")
+        return cls._validate_api_key(api_key, "api_key")
+
+    def _authorization_header(self) -> str:
+        return f"Bearer {self._validate_api_key(self.api_key, 'api_key')}"
 
     def _request(self, method: str, path: str, data: Dict = None) -> Dict:
         url = f"{self.base_url}/api/v2{path}"
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": self._authorization_header(),
             "Content-Type": "application/json",
         }
         body = json.dumps(data).encode() if data else None
@@ -28,7 +53,12 @@ class OrchestratorClient:
         except HTTPError as e:
             return {"error": e.code, "message": e.reason}
 
-    def register_agent(self, name: str, agent_type: str, config: Dict = None) -> Dict:
+    def register_agent(
+        self,
+        name: str,
+        agent_type: str,
+        config: Dict = None,
+    ) -> Dict:
         return self._request("POST", "/agents", {
             "name": name,
             "agent_type": agent_type,
