@@ -4,6 +4,8 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
+from src.common.metrics import metrics
+
 
 class StepStatus(Enum):
     PENDING = "pending"
@@ -13,28 +15,112 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowMetadataError(ValueError):
+    pass
+
+
+RESERVED_METADATA_KEYS = {
+    "agent_id",
+    "error",
+    "handler",
+    "id",
+    "next_step",
+    "parent_id",
+    "queue",
+    "result",
+    "retry",
+    "routing_key",
+    "run_id",
+    "state",
+    "status",
+    "step_id",
+    "task_id",
+    "workflow_id",
+}
+
+
+def _normalize_metadata_key(key: Any) -> str:
+    normalized = str(key).replace("-", "_")
+    result = []
+    for index, char in enumerate(normalized):
+        if char.isupper() and index > 0:
+            result.append("_")
+        result.append(char.lower())
+    return "".join(result)
+
+
+def _find_reserved_metadata_key(
+    metadata: Any,
+    prefix: str = "metadata",
+) -> Optional[str]:
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            path = f"{prefix}.{key}"
+            if _normalize_metadata_key(key) in RESERVED_METADATA_KEYS:
+                return path
+            nested = _find_reserved_metadata_key(value, path)
+            if nested:
+                return nested
+    elif isinstance(metadata, list):
+        for index, item in enumerate(metadata):
+            nested = _find_reserved_metadata_key(item, f"{prefix}[{index}]")
+            if nested:
+                return nested
+    return None
+
+
+def validate_user_metadata(metadata: Optional[Dict[str, Any]]) -> None:
+    if metadata is None:
+        return
+    if not isinstance(metadata, dict):
+        raise WorkflowMetadataError("workflow metadata must be a mapping")
+
+    reserved_path = _find_reserved_metadata_key(metadata)
+    if reserved_path:
+        raise WorkflowMetadataError(
+            f"reserved workflow metadata key: {reserved_path}",
+        )
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        validate_user_metadata(metadata)
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.metadata = metadata or {}
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
 
 
 class Workflow:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        validate_user_metadata(metadata)
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self.metadata = metadata or {}
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        validate_user_metadata(step.metadata)
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -46,9 +132,15 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
-    def create_workflow(self, name: str, description: str = "") -> Workflow:
-        workflow = Workflow(name, description)
+    def create_workflow(
+        self,
+        name: str,
+        description: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Workflow:
+        workflow = Workflow(name, description, metadata=metadata)
         self._workflows[workflow.id] = workflow
         return workflow
 
@@ -58,12 +150,20 @@ class WorkflowManager:
     def list_workflows(self) -> List[Workflow]:
         return list(self._workflows.values())
 
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
+            return False
+
+        invalid_path = self._invalid_metadata_path(workflow)
+        if invalid_path:
+            self._record_metadata_rejection(workflow, invalid_path)
             return False
 
         workflow.status = StepStatus.RUNNING
@@ -81,6 +181,38 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _invalid_metadata_path(self, workflow: Workflow) -> Optional[str]:
+        invalid_path = _find_reserved_metadata_key(
+            workflow.metadata,
+            prefix="workflow.metadata",
+        )
+        if invalid_path:
+            return invalid_path
+
+        for step in workflow.steps:
+            invalid_path = _find_reserved_metadata_key(
+                step.metadata,
+                prefix=f"step[{step.id}].metadata",
+            )
+            if invalid_path:
+                return invalid_path
+        return None
+
+    def _record_metadata_rejection(
+        self,
+        workflow: Workflow,
+        invalid_path: str,
+    ) -> None:
+        workflow.status = StepStatus.PENDING
+        metrics.increment("workflow.metadata.rejected")
+        self._audit_records.append({
+            "event": "workflow_metadata_rejected",
+            "workflow_id": workflow.id,
+            "workflow_status": workflow.status.value,
+            "key_path": invalid_path,
+            "reason": "reserved_metadata_key",
+        })
 
 # 2019-03-27T19:58:07 update
 
