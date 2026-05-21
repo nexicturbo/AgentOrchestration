@@ -1,8 +1,14 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
+
+import yaml
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -13,9 +19,26 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowDefinitionError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        audit_record: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.audit_record = audit_record or {}
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
-        self.id = str(uuid4())
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        step_id: Optional[str] = None,
+    ):
+        self.id = step_id or str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
@@ -35,6 +58,16 @@ class Workflow:
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        if step.id in self._step_map:
+            raise WorkflowDefinitionError(
+                f"Duplicate workflow step id: {step.id}",
+                {
+                    "event": "workflow_registration_rejected",
+                    "decision": "duplicate_node_id",
+                    "node_id": step.id,
+                    "workflow_id": self.id,
+                },
+            )
         self.steps.append(step)
         self._step_map[step.id] = step
         return self
@@ -46,11 +79,188 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
         self._workflows[workflow.id] = workflow
         return workflow
+
+    def create_workflow_from_yaml(
+        self,
+        yaml_text: str,
+        handlers: Optional[Dict[str, Callable]] = None,
+        import_resolver: Optional[Callable[[str], Dict[str, Any]]] = None,
+        base_path: Optional[Path] = None,
+    ) -> Workflow:
+        definition = yaml.safe_load(yaml_text) or {}
+        if not isinstance(definition, dict):
+            raise WorkflowDefinitionError("Workflow YAML must be a mapping")
+        return self.create_workflow_from_definition(
+            definition,
+            handlers=handlers,
+            import_resolver=import_resolver,
+            base_path=base_path,
+        )
+
+    def load_workflow_from_yaml(
+        self,
+        path: str,
+        handlers: Optional[Dict[str, Callable]] = None,
+        import_resolver: Optional[Callable[[str], Dict[str, Any]]] = None,
+    ) -> Workflow:
+        workflow_path = Path(path)
+        return self.create_workflow_from_yaml(
+            workflow_path.read_text(),
+            handlers=handlers,
+            import_resolver=import_resolver,
+            base_path=workflow_path.parent,
+        )
+
+    def create_workflow_from_definition(
+        self,
+        definition: Dict[str, Any],
+        handlers: Optional[Dict[str, Callable]] = None,
+        import_resolver: Optional[Callable[[str], Dict[str, Any]]] = None,
+        base_path: Optional[Path] = None,
+    ) -> Workflow:
+        handlers = handlers or {}
+        step_specs = self._collect_step_specs(
+            definition,
+            import_resolver=import_resolver,
+            base_path=base_path,
+        )
+        self._reject_duplicate_node_ids(step_specs)
+
+        workflow = Workflow(
+            definition.get("name", "workflow"),
+            definition.get("description", ""),
+        )
+        for step_id, _, spec in step_specs:
+            handler_key = spec.get("handler", step_id)
+            handler = handlers.get(handler_key, handlers.get(step_id))
+            if handler is None:
+                handler = self._unbound_handler(step_id)
+            workflow.add_step(
+                WorkflowStep(
+                    spec.get("name", step_id),
+                    handler,
+                    retries=int(spec.get("retries", 0)),
+                    timeout=int(spec.get("timeout", 300)),
+                    step_id=step_id,
+                )
+            )
+
+        self._workflows[workflow.id] = workflow
+        return workflow
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
+    def _collect_step_specs(
+        self,
+        definition: Dict[str, Any],
+        import_resolver: Optional[Callable[[str], Dict[str, Any]]] = None,
+        source: str = "root",
+        import_stack: Optional[Set[str]] = None,
+        base_path: Optional[Path] = None,
+    ) -> List[Tuple[str, str, Dict[str, Any]]]:
+        import_stack = import_stack or set()
+        specs: List[Tuple[str, str, Dict[str, Any]]] = []
+
+        for import_name in definition.get("imports", []) or []:
+            imported, import_source, next_base_path = self._resolve_import(
+                str(import_name),
+                import_resolver,
+                base_path,
+            )
+            if import_source in import_stack:
+                raise WorkflowDefinitionError(
+                    f"Recursive workflow import rejected: {import_name}"
+                )
+            if not isinstance(imported, dict):
+                raise WorkflowDefinitionError(
+                    f"Workflow import is not a mapping: {import_name}"
+                )
+            specs.extend(
+                self._collect_step_specs(
+                    imported,
+                    import_resolver,
+                    source=import_source,
+                    import_stack=import_stack | {import_source},
+                    base_path=next_base_path,
+                )
+            )
+
+        raw_steps = definition.get("steps", definition.get("nodes", [])) or []
+        if not isinstance(raw_steps, list):
+            raise WorkflowDefinitionError("Workflow steps must be a list")
+        for index, spec in enumerate(raw_steps):
+            if not isinstance(spec, dict):
+                raise WorkflowDefinitionError(
+                    "Workflow step must be a mapping"
+                )
+            step_id = spec.get("id")
+            if not step_id:
+                raise WorkflowDefinitionError(
+                    f"Workflow step at {source}[{index}] is missing id"
+                )
+            specs.append((str(step_id), source, spec))
+
+        return specs
+
+    def _resolve_import(
+        self,
+        import_name: str,
+        import_resolver: Optional[Callable[[str], Dict[str, Any]]],
+        base_path: Optional[Path],
+    ) -> Tuple[Dict[str, Any], str, Optional[Path]]:
+        if import_resolver:
+            return import_resolver(import_name), import_name, base_path
+
+        import_path = Path(import_name)
+        if not import_path.is_absolute() and base_path is not None:
+            import_path = base_path / import_path
+        import_path = import_path.resolve()
+        return (
+            yaml.safe_load(import_path.read_text()) or {},
+            str(import_path),
+            import_path.parent,
+        )
+
+    def _reject_duplicate_node_ids(
+        self,
+        step_specs: List[Tuple[str, str, Dict[str, Any]]],
+    ) -> None:
+        seen: Dict[str, str] = {}
+        for step_id, source, _ in step_specs:
+            if step_id in seen:
+                audit_record = {
+                    "event": "workflow_registration_rejected",
+                    "decision": "duplicate_node_id",
+                    "node_id": step_id,
+                    "first_source": seen[step_id],
+                    "duplicate_source": source,
+                }
+                self._audit_records.append(audit_record)
+                logger.warning(
+                    "Rejected workflow registration with duplicate node id %s",
+                    step_id,
+                )
+                raise WorkflowDefinitionError(
+                    f"Duplicate workflow node id: {step_id}",
+                    audit_record,
+                )
+            seen[step_id] = source
+
+    @staticmethod
+    def _unbound_handler(step_id: str) -> Callable:
+        def handler():
+            raise RuntimeError(
+                f"No handler registered for workflow step {step_id}"
+            )
+
+        return handler
 
     def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
         return self._workflows.get(workflow_id)

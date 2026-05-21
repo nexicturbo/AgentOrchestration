@@ -34,17 +34,24 @@ class MetricsCollector:
         with self._lock:
             if metric in self._timers:
                 duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
+                self._histograms[metric].append(duration)
                 return duration
         return 0.0
 
     def snapshot(self) -> Dict:
         with self._lock:
+            histograms = {
+                k: {
+                    "count": len(v),
+                    "sum": sum(v),
+                    "avg": sum(v) / len(v) if v else 0,
+                }
+                for k, v in self._histograms.items()
+            }
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": histograms,
             }
 
 
