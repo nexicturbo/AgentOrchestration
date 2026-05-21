@@ -1,8 +1,15 @@
 """Configuration management module."""
 
-import os
 import json
+import os
 from typing import Any, Dict, Optional
+
+
+CONFIG_ENV_PREFIX = "AO_CONFIG_"
+LEGACY_ENV_OVERRIDES = {
+    "AO_API_KEY": "api.key",
+    "AO_API_URL": "api.url",
+}
 
 
 class Config:
@@ -17,11 +24,22 @@ class Config:
             self._data = json.load(f)
 
     def _load_env_overrides(self) -> None:
-        prefix = "AO_"
         for key, value in os.environ.items():
-            if key.startswith(prefix):
-                config_key = key[len(prefix):].lower().replace("_", ".")
+            config_key = self._env_key_to_config_key(key)
+            if config_key:
                 self._set_nested(config_key, value)
+
+    @staticmethod
+    def _env_key_to_config_key(env_key: str) -> Optional[str]:
+        if env_key in LEGACY_ENV_OVERRIDES:
+            return LEGACY_ENV_OVERRIDES[env_key]
+        if not env_key.startswith(CONFIG_ENV_PREFIX):
+            return None
+
+        suffix = env_key[len(CONFIG_ENV_PREFIX):]
+        if not suffix:
+            return None
+        return suffix.lower().replace("_", ".")
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")

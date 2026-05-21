@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,49 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_runtime_only_ao_variables_are_not_imported(self, monkeypatch):
+        monkeypatch.setenv("AO_AGENT_ID", "agent-123")
+        monkeypatch.setenv("AO_WORKFLOW_ID", "workflow-456")
+        monkeypatch.setenv("AO_CONFIG_APP_NAME", "configured-app")
+        monkeypatch.setenv("AO_CONFIG_WORKER_POOL_SIZE", "4")
+
+        config = Config()
+
+        assert config.get("agent.id") is None
+        assert config.get("workflow.id") is None
+        assert config.get("app.name") == "configured-app"
+        assert config.get("worker.pool.size") == "4"
+
+    def test_runtime_ao_agent_id_does_not_leak_into_file_config(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"app": {"name": "file-app"}}')
+        monkeypatch.setenv("AO_AGENT_ID", "runtime-agent")
+        monkeypatch.setenv("AO_CONFIG_APP_PORT", "8080")
+
+        config = Config(str(config_file))
+
+        assert config.to_dict() == {
+            "app": {
+                "name": "file-app",
+                "port": "8080",
+            },
+        }
+
+    def test_documented_legacy_ao_overrides_still_import(self, monkeypatch):
+        monkeypatch.setenv("AO_API_URL", "https://api.example.test")
+        monkeypatch.setenv("AO_API_KEY", "test-key")
+        monkeypatch.setenv("AO_AGENT_ID", "runtime-agent")
+
+        config = Config()
+
+        assert config.get("api.url") == "https://api.example.test"
+        assert config.get("api.key") == "test-key"
+        assert "agent" not in config.to_dict()
 
 # 2019-02-01T18:58:35 update
 
