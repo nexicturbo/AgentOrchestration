@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,70 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_retry_preserves_retry_count(self):
+        self.scheduler.enqueue({"type": "test"}, priority=5)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task["id"]
+        assert retried["retries"] == 1
+
+    def test_terminal_failure_writes_dead_letter_once(self):
+        self.scheduler._max_retries = 1
+        self.scheduler.enqueue({
+            "type": "test",
+            "payload": {"secret": "do-not-copy"},
+        })
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert not self.scheduler.fail(task["id"])
+        assert not self.scheduler.fail(task["id"])
+
+        dead_letters = self.scheduler.dead_letters()
+        assert len(dead_letters) == 1
+        assert dead_letters[0] == {
+            "task_id": task["id"],
+            "task_type": "test",
+            "queue": "default",
+            "priority": 0,
+            "retries": 1,
+        }
+        assert "payload" not in dead_letters[0]
+        decisions = [
+            event["decision"]
+            for event in self.scheduler.dead_letter_audit()
+        ]
+        assert decisions == [
+            "written",
+            "duplicate",
+        ]
+
+    def test_dead_letter_writer_failure_defers_ack_without_losing_task(self):
+        def failing_writer(record):
+            raise RuntimeError("store unavailable with private details")
+
+        scheduler = TaskScheduler(dead_letter_writer=failing_writer)
+        scheduler._max_retries = 1
+        scheduler.enqueue({
+            "type": "test",
+            "payload": {"secret": "keep-private"},
+        })
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert not scheduler.fail(task["id"])
+        assert scheduler.dead_letters() == []
+        assert scheduler.dead_letter_audit()[-1]["decision"] == "deferred"
+        audit_text = str(scheduler.dead_letter_audit()[-1])
+        assert "store unavailable" not in audit_text
+        assert scheduler.complete(task["id"])
 
 # 2019-01-09T19:07:03 update
 
