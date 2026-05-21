@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,30 +30,59 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        dead_letter_writer: Optional[Callable[[Dict], None]] = None,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._dead_letters: Dict[str, Dict] = {}
+        self._dead_letter_writer = dead_letter_writer
+        self.dead_letter_audit_log: List[Dict[str, Any]] = []
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["retries"] = task.get("retries", 0)
 
+        self._push_task(task, queue, priority)
+        return task_id
+
+    def _push_task(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -73,13 +101,64 @@ class TaskScheduler:
         return self._in_flight.pop(task_id, None) is not None
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+        if task_id in self._dead_letters:
+            self._audit_dead_letter(self._dead_letters[task_id], "duplicate")
+            return False
+
+        task = self._in_flight.get(task_id)
+        if task is None:
+            return False
+
+        next_retries = task["retries"] + 1
+        if next_retries < self._max_retries:
+            self._in_flight.pop(task_id, None)
+            task["retries"] = next_retries
+            task["enqueued_at"] = time.time()
+            self._push_task(task, queue, priority=task.get("priority", 0))
+            return True
+
+        record = self._build_dead_letter_record(task, next_retries, queue)
+        try:
+            if self._dead_letter_writer:
+                self._dead_letter_writer(record)
+        except Exception:
+            self._audit_dead_letter(record, "deferred")
+            return False
+
+        self._in_flight.pop(task_id, None)
+        task["retries"] = next_retries
+        self._dead_letters[task_id] = record
+        self._audit_dead_letter(record, "written")
         return False
+
+    def dead_letters(self) -> List[Dict]:
+        return [dict(record) for record in self._dead_letters.values()]
+
+    def dead_letter_audit(self) -> List[Dict]:
+        return [dict(record) for record in self.dead_letter_audit_log]
+
+    def _build_dead_letter_record(
+        self,
+        task: Dict,
+        retries: int,
+        queue: str,
+    ) -> Dict:
+        return {
+            "task_id": task["id"],
+            "task_type": task.get("type"),
+            "queue": queue,
+            "priority": task.get("priority", 0),
+            "retries": retries,
+        }
+
+    def _audit_dead_letter(self, record: Dict, decision: str) -> None:
+        self.dead_letter_audit_log.append({
+            "decision": decision,
+            "task_id": record.get("task_id"),
+            "queue": record.get("queue"),
+            "retries": record.get("retries"),
+        })
+        self.dead_letter_audit_log = self.dead_letter_audit_log[-100:]
 
 # 2019-04-25T08:37:12 update
 
