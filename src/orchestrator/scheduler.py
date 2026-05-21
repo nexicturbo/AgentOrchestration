@@ -109,6 +109,7 @@ class TaskScheduler:
                     task,
                     "tenant_capacity_available",
                     queue,
+                    source="queued_dispatch",
                 )
                 return task
         return None
@@ -144,6 +145,7 @@ class TaskScheduler:
                     task,
                     "duplicate_recovery_task",
                     queue,
+                    source="restart_recovery",
                 )
                 continue
 
@@ -156,6 +158,7 @@ class TaskScheduler:
                     task,
                     "tenant_capacity_available",
                     queue,
+                    source="restart_recovery",
                 )
             else:
                 task["recovery_state"] = "deferred"
@@ -167,6 +170,7 @@ class TaskScheduler:
                     task,
                     "tenant_concurrency_limit",
                     queue,
+                    source="restart_recovery",
                 )
         return result
 
@@ -206,6 +210,7 @@ class TaskScheduler:
                 task,
                 "tenant_concurrency_limit",
                 queue,
+                source="queued_dispatch",
             )
 
         for entry in pending:
@@ -244,11 +249,13 @@ class TaskScheduler:
         task: Dict,
         reason: str,
         queue: str,
+        source: str,
     ) -> None:
         self._audit_log.append(
             {
                 "decision": decision,
                 "reason": reason,
+                "source": source,
                 "task_id": task.get("id"),
                 "tenant_id": self._tenant_id(task),
                 "tenant_in_flight": self._tenant_in_flight_count(task),

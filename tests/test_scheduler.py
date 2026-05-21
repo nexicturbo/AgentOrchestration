@@ -47,6 +47,7 @@ class TestTaskScheduler:
         assert scheduler.audit_log[-1] == {
             "decision": "deferred",
             "reason": "tenant_concurrency_limit",
+            "source": "queued_dispatch",
             "task_id": second_id,
             "tenant_id": "tenant-a",
             "tenant_in_flight": 1,
@@ -91,6 +92,7 @@ class TestTaskScheduler:
         assert scheduler.audit_log[-1] == {
             "decision": "deferred",
             "reason": "tenant_concurrency_limit",
+            "source": "restart_recovery",
             "task_id": "run-2",
             "tenant_id": "tenant-a",
             "tenant_in_flight": 1,
@@ -144,6 +146,7 @@ class TestTaskScheduler:
         assert scheduler.audit_log[-1] == {
             "decision": "skipped",
             "reason": "duplicate_recovery_task",
+            "source": "restart_recovery",
             "task_id": "active-1",
             "tenant_id": "tenant-a",
             "tenant_in_flight": 1,
