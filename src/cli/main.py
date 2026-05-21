@@ -104,12 +104,16 @@ def cli():
                 print(f"- {issue}")
             if decision.migration_error:
                 print(f"- {decision.migration_error}")
+            for event in decision.audit_events:
+                print(f"audit: {event.event}={event.decision}")
             sys.exit(2)
         print(
             f"Deploying {plan.target_version}; "
             f"migrations {decision.migration_status.value}; "
             f"traffic shifted to {decision.traffic_version}"
         )
+        for event in decision.audit_events:
+            print(f"audit: {event.event}={event.decision}")
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":

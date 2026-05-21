@@ -28,6 +28,7 @@ def test_deploy_blocks_manifest_when_migration_fails(
     output = capsys.readouterr().out
     assert "Rollout blocked; serving v1" in output
     assert "migration failed: fail:add_task_state" in output
+    assert "audit: rollout_blocked=keep_prior_version" in output
 
 
 def test_deploy_shifts_traffic_after_successful_migrations(
@@ -51,3 +52,4 @@ def test_deploy_shifts_traffic_after_successful_migrations(
     assert "Deploying v2" in output
     assert "migrations succeeded" in output
     assert "traffic shifted to v2" in output
+    assert "audit: traffic_shifted=migrations_succeeded" in output

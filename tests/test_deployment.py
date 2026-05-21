@@ -27,6 +27,13 @@ def test_migrations_complete_before_new_version_receives_traffic():
     assert decision.allowed
     assert decision.migration_status is MigrationStatus.SUCCEEDED
     assert decision.traffic_version == "v2"
+    assert [event.event for event in decision.audit_events] == [
+        "compatibility_checked",
+        "migration_job_started",
+        "traffic_shifted",
+    ]
+    assert decision.audit_events[-1].decision == "migrations_succeeded"
+    assert decision.audit_events[-1].reason == "migration_gate_passed"
 
 
 def test_migration_failure_stops_rollout_and_keeps_prior_version_serving():
@@ -47,6 +54,9 @@ def test_migration_failure_stops_rollout_and_keeps_prior_version_serving():
     assert decision.serving_version == "v1"
     assert decision.traffic_version == "v1"
     assert "backfill_task_state failed" in decision.migration_error
+    assert decision.audit_events[-1].event == "rollout_blocked"
+    assert decision.audit_events[-1].decision == "keep_prior_version"
+    assert decision.audit_events[-1].reason == "migration_failed"
 
 
 def test_reversible_release_blocks_forward_only_migrations_before_rollout():
@@ -75,3 +85,6 @@ def test_reversible_release_blocks_forward_only_migrations_before_rollout():
     assert decision.compatibility.issues == [
         "drop_legacy_task_state is not backward compatible"
     ]
+    assert decision.audit_events[-1].event == "rollout_blocked"
+    assert decision.audit_events[-1].decision == "keep_prior_version"
+    assert decision.audit_events[-1].reason == "incompatible_migration"
