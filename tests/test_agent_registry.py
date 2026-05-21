@@ -175,6 +175,45 @@ class TestAgentRegistry:
         assert self.registry.resolve_capability_alias("summarize.text") is None
         assert self.registry.get(agent_id)["status"] == "stopped"
 
+    def test_concurrent_case_insensitive_duplicate_registration_is_atomic(
+        self,
+    ):
+        results = []
+
+        def register(alias):
+            try:
+                return self.registry.register(
+                    f"agent-{alias}",
+                    "worker.processor",
+                    {"capability_aliases": [alias]},
+                )
+            except ValueError as exc:
+                return str(exc)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(register, "Summarize.Text"),
+                executor.submit(register, " summarize.text "),
+            ]
+            for future in futures:
+                results.append(future.result())
+
+        winners = [
+            result for result in results if "already registered" not in result
+        ]
+        rejects = [
+            result for result in results if "already registered" in result
+        ]
+
+        assert len(winners) == 1
+        assert len(rejects) == 1
+        assert self.registry.count() == 1
+        self.registry.update_status(winners[0], AgentStatus.RUNNING)
+        assert (
+            self.registry.resolve_capability_alias("SUMMARIZE.TEXT")["id"]
+            == winners[0]
+        )
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
