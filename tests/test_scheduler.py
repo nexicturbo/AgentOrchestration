@@ -59,6 +59,34 @@ class TestTaskScheduler:
         second_task = asyncio.run(scheduler.dequeue())
         assert second_task["id"] == second_id
 
+    def test_dequeue_skips_blocked_tenant_and_dispatches_available_work(self):
+        scheduler = TaskScheduler(max_concurrent_per_tenant=1)
+        scheduler._in_flight["active-a"] = {
+            "id": "active-a",
+            "type": "run",
+            "tenant_id": "tenant-a",
+        }
+        blocked_id = scheduler.enqueue(
+            {"type": "run", "tenant_id": "tenant-a"}
+        )
+        available_id = scheduler.enqueue(
+            {"type": "run", "tenant_id": "tenant-b"}
+        )
+
+        available_task = asyncio.run(scheduler.dequeue())
+
+        assert available_task["id"] == available_id
+        assert blocked_id not in scheduler._in_flight
+        assert scheduler.audit_log[-2]["decision"] == "deferred"
+        assert scheduler.audit_log[-2]["source"] == "queued_dispatch"
+        assert scheduler.audit_log[-2]["task_id"] == blocked_id
+        assert scheduler.audit_log[-1]["decision"] == "dispatched"
+        assert scheduler.audit_log[-1]["task_id"] == available_id
+
+        assert scheduler.complete("active-a")
+        blocked_task = asyncio.run(scheduler.dequeue())
+        assert blocked_task["id"] == blocked_id
+
     def test_recovery_defers_over_capacity_tenant_tasks(self):
         scheduler = TaskScheduler(max_concurrent_per_tenant=1)
         recovered = [
