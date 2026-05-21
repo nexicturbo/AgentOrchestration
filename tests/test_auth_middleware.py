@@ -59,6 +59,17 @@ class TestProtectedRouteAuth:
         assert response.status_code == 401
         assert response.text == "revoked_credentials"
 
+    def test_malformed_bearer_token_is_denied(self):
+        client = make_client(build_principal("valid-token"))
+
+        response = client.get(
+            "/api/v2/agents",
+            headers={"Authorization": "Bearer "},
+        )
+
+        assert response.status_code == 401
+        assert response.text == "malformed_credentials"
+
     def test_insufficient_role_is_denied(self):
         client = make_client(build_principal("viewer-token", role="viewer"))
 
@@ -69,6 +80,22 @@ class TestProtectedRouteAuth:
 
         assert response.status_code == 401
         assert response.text == "insufficient_role"
+
+    def test_wrong_workspace_is_denied(self):
+        client = make_client(
+            build_principal("valid-token", workspaces={"workspace-a"})
+        )
+
+        response = client.get(
+            "/api/v2/agents",
+            headers={
+                "Authorization": "Bearer valid-token",
+                "X-AO-Workspace": "workspace-b",
+            },
+        )
+
+        assert response.status_code == 401
+        assert response.text == "wrong_workspace"
 
     def test_insufficient_scope_is_denied_for_mutating_route(self):
         client = make_client(
@@ -88,11 +115,16 @@ class TestProtectedRouteAuth:
         assert response.text == "insufficient_scope"
 
     def test_authorized_bearer_token_can_read_protected_route(self):
-        client = make_client(build_principal("valid-token"))
+        client = make_client(
+            build_principal("valid-token", workspaces={"workspace-a"})
+        )
 
         response = client.get(
             "/api/v2/agents",
-            headers={"Authorization": "Bearer valid-token"},
+            headers={
+                "Authorization": "Bearer valid-token",
+                "X-AO-Workspace": "workspace-a",
+            },
         )
 
         assert response.status_code == 200
@@ -103,12 +135,14 @@ class TestProtectedRouteAuth:
             build_principal(
                 token="session-token",
                 scopes={READ_SCOPE, WRITE_SCOPE},
+                workspaces={"workspace-a"},
             )
         )
 
         response = client.post(
             "/api/v2/agents",
             params={"name": "runner", "agent_type": "worker"},
+            headers={"X-AO-Workspace": "workspace-a"},
             cookies={"ao_session": "session-token"},
         )
 
