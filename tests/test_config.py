@@ -1,5 +1,5 @@
 import pytest
-from src.common.config import Config
+from src.common.config import Config, ConfigurationError
 
 
 class TestConfig:
@@ -31,6 +31,42 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_env_scalar_cannot_replace_file_config_branch(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"app": {"name": "test", "port": 8080}}')
+        monkeypatch.setenv("AO_APP", "production")
+
+        with pytest.raises(ConfigurationError) as exc:
+            Config(str(config_file))
+
+        message = str(exc.value)
+        assert "Cannot replace config branch 'app'" in message
+        assert "AO_APP" in message
+        assert "production" not in message
+
+    def test_nested_set_cannot_write_through_scalar_branch(self):
+        config = Config()
+        config.set("app", "production")
+
+        with pytest.raises(ConfigurationError) as exc:
+            config.set("app.name", "test")
+
+        assert "app" in str(exc.value)
+        assert config.get("app") == "production"
+
+    def test_dict_values_can_replace_existing_config_branches(self):
+        config = Config()
+        config.set("app.name", "old")
+
+        config.set("app", {"name": "new", "port": 8080})
+
+        assert config.get("app.name") == "new"
+        assert config.get("app.port") == 8080
 
 # 2019-02-01T18:58:35 update
 

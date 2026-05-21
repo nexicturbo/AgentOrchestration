@@ -5,6 +5,10 @@ import json
 from typing import Any, Dict, Optional
 
 
+class ConfigurationError(ValueError):
+    """Raised when configuration cannot be loaded safely."""
+
+
 class Config:
     def __init__(self, config_path: Optional[str] = None):
         self._data: Dict[str, Any] = {}
@@ -21,16 +25,39 @@ class Config:
         for key, value in os.environ.items():
             if key.startswith(prefix):
                 config_key = key[len(prefix):].lower().replace("_", ".")
-                self._set_nested(config_key, value)
+                self._set_nested(config_key, value, source=key)
 
-    def _set_nested(self, key: str, value: Any) -> None:
+    def _set_nested(
+        self,
+        key: str,
+        value: Any,
+        source: Optional[str] = None,
+    ) -> None:
         parts = key.split(".")
         current = self._data
-        for part in parts[:-1]:
+        for index, part in enumerate(parts[:-1]):
             if part not in current:
                 current[part] = {}
+            if not isinstance(current[part], dict):
+                path = ".".join(parts[:index + 1])
+                raise ConfigurationError(
+                    f"Cannot set '{key}': '{path}' is already a scalar value"
+                )
             current = current[part]
-        current[parts[-1]] = value
+
+        leaf = parts[-1]
+        if (
+            leaf in current
+            and isinstance(current[leaf], dict)
+            and not isinstance(value, dict)
+        ):
+            source_text = f" from {source}" if source else ""
+            raise ConfigurationError(
+                f"Cannot replace config branch '{key}'"
+                f" with scalar value{source_text}"
+            )
+
+        current[leaf] = value
 
     def get(self, key: str, default: Any = None) -> Any:
         parts = key.split(".")
