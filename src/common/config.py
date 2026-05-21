@@ -1,8 +1,15 @@
 """Configuration management module."""
 
-import os
 import json
+import os
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+import yaml
+
+
+class ConfigurationError(ValueError):
+    """Raised when a configuration file cannot be loaded safely."""
 
 
 class Config:
@@ -13,8 +20,26 @@ class Config:
         self._load_env_overrides()
 
     def load(self, path: str) -> None:
-        with open(path) as f:
-            self._data = json.load(f)
+        config_path = Path(path)
+        suffix = config_path.suffix.lower()
+
+        with config_path.open() as f:
+            if suffix == ".json":
+                data = json.load(f)
+            elif suffix in {".yaml", ".yml"}:
+                data = yaml.safe_load(f) or {}
+            else:
+                raise ConfigurationError(
+                    f"Unsupported config format '{suffix or '<none>'}'. "
+                    "Use .json, .yaml, or .yml."
+                )
+
+        if not isinstance(data, dict):
+            raise ConfigurationError(
+                "Config file must contain a mapping at the top level."
+            )
+
+        self._data = data
 
     def _load_env_overrides(self) -> None:
         prefix = "AO_"

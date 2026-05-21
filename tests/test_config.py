@@ -1,5 +1,5 @@
 import pytest
-from src.common.config import Config
+from src.common.config import Config, ConfigurationError
 
 
 class TestConfig:
@@ -9,6 +9,29 @@ class TestConfig:
         config = Config(str(config_file))
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
+
+    def test_load_yaml_config(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("app:\n  name: test\n  port: 8080\n")
+        config = Config(str(config_file))
+        assert config.get("app.name") == "test"
+        assert config.get("app.port") == 8080
+
+    def test_rejects_unsupported_config_format(self, tmp_path):
+        config_file = tmp_path / "config.toml"
+        config_file.write_text("[app]\nname = 'test'\n")
+        with pytest.raises(
+            ConfigurationError, match="Use .json, .yaml, or .yml"
+        ):
+            Config(str(config_file))
+
+    def test_rejects_non_mapping_config(self, tmp_path):
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("- app\n- database\n")
+        with pytest.raises(
+            ConfigurationError, match="mapping at the top level"
+        ):
+            Config(str(config_file))
 
     def test_default_value(self):
         config = Config()
