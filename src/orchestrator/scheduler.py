@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from uuid import uuid4
 
 
@@ -21,6 +20,14 @@ class PriorityQueue:
             return heapq.heappop(self._queue)[2]
         return None
 
+    def pop_entry(self) -> Optional[Tuple[int, int, Any]]:
+        if self._queue:
+            return heapq.heappop(self._queue)
+        return None
+
+    def push_entry(self, entry: Tuple[int, int, Any]) -> None:
+        heapq.heappush(self._queue, entry)
+
     def peek(self) -> Optional[Any]:
         if self._queue:
             return self._queue[0][2]
@@ -31,13 +38,21 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, max_concurrent_per_tenant: Optional[int] = None):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._recovery_deferred: Dict[str, Dict] = {}
+        self._audit_log: List[Dict] = []
+        self._max_concurrent_per_tenant = max_concurrent_per_tenant
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,24 +63,53 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        self._scheduled[task_id] = {
+            "ready_at": time.time() + delay,
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, scheduled in self._scheduled.items()
+            if scheduled["ready_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid)
+            if scheduled:
+                self._enqueue_existing(
+                    scheduled["task"],
+                    scheduled["queue"],
+                    priority=scheduled["priority"],
+                )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
+            task = self._pop_dispatchable_task(queue)
             if task:
                 self._in_flight[task["id"]] = task
+                self._record_audit(
+                    "dispatched",
+                    task,
+                    "tenant_capacity_available",
+                    queue,
+                )
                 return task
         return None
 
@@ -77,9 +121,129 @@ class TaskScheduler:
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._enqueue_existing(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                )
                 return True
         return False
+
+    def recover_in_flight(
+        self,
+        tasks: Iterable[Dict],
+        queue: str = "default",
+    ) -> Dict[str, List[str]]:
+        result = {"accepted": [], "deferred": []}
+        for task in tasks:
+            task_id = task.setdefault("id", str(uuid4()))
+            if self._can_dispatch(task):
+                self._in_flight[task_id] = task
+                task["recovered_at"] = time.time()
+                result["accepted"].append(task_id)
+                self._record_audit(
+                    "recovered",
+                    task,
+                    "tenant_capacity_available",
+                    queue,
+                )
+            else:
+                self._recovery_deferred[task_id] = task
+                result["deferred"].append(task_id)
+                self._record_audit(
+                    "deferred",
+                    task,
+                    "tenant_concurrency_limit",
+                    queue,
+                )
+        return result
+
+    @property
+    def audit_log(self) -> List[Dict]:
+        return list(self._audit_log)
+
+    def _enqueue_existing(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int = 0,
+    ) -> str:
+        task_id = task.setdefault("id", str(uuid4()))
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
+        return task_id
+
+    def _pop_dispatchable_task(self, queue: str) -> Optional[Dict]:
+        pending = []
+        selected = None
+
+        while len(self._queues[queue]) > 0:
+            entry = self._queues[queue].pop_entry()
+            if entry is None:
+                break
+
+            task = entry[2]
+            if self._can_dispatch(task):
+                selected = task
+                break
+
+            pending.append(entry)
+            self._record_audit(
+                "deferred",
+                task,
+                "tenant_concurrency_limit",
+                queue,
+            )
+
+        for entry in pending:
+            self._queues[queue].push_entry(entry)
+        return selected
+
+    def _can_dispatch(self, task: Dict) -> bool:
+        limit = self._tenant_limit(task)
+        if limit is None:
+            return True
+        return self._tenant_in_flight_count(task) < limit
+
+    def _tenant_limit(self, task: Dict) -> Optional[int]:
+        limit = task.get(
+            "max_concurrent_per_tenant",
+            self._max_concurrent_per_tenant,
+        )
+        if limit is None:
+            return None
+        return max(int(limit), 0)
+
+    def _tenant_in_flight_count(self, task: Dict) -> int:
+        tenant_id = self._tenant_id(task)
+        return sum(
+            1
+            for in_flight in self._in_flight.values()
+            if self._tenant_id(in_flight) == tenant_id
+        )
+
+    def _tenant_id(self, task: Dict) -> str:
+        return str(task.get("tenant_id", "default"))
+
+    def _record_audit(
+        self,
+        decision: str,
+        task: Dict,
+        reason: str,
+        queue: str,
+    ) -> None:
+        self._audit_log.append(
+            {
+                "decision": decision,
+                "reason": reason,
+                "task_id": task.get("id"),
+                "tenant_id": self._tenant_id(task),
+                "tenant_in_flight": self._tenant_in_flight_count(task),
+                "tenant_limit": self._tenant_limit(task),
+                "queue": queue,
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 

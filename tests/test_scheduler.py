@@ -1,4 +1,5 @@
-import pytest
+import asyncio
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +13,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +20,77 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_defers_task_when_tenant_capacity_is_full(self):
+        scheduler = TaskScheduler(max_concurrent_per_tenant=1)
+        first_id = scheduler.enqueue({"type": "run", "tenant_id": "tenant-a"})
+        second_id = scheduler.enqueue({"type": "run", "tenant_id": "tenant-a"})
+
+        first_task = asyncio.run(scheduler.dequeue())
+        blocked_task = asyncio.run(scheduler.dequeue())
+
+        assert first_task["id"] == first_id
+        assert blocked_task is None
+        assert second_id not in scheduler._in_flight
+        assert scheduler.audit_log[-1] == {
+            "decision": "deferred",
+            "reason": "tenant_concurrency_limit",
+            "task_id": second_id,
+            "tenant_id": "tenant-a",
+            "tenant_in_flight": 1,
+            "tenant_limit": 1,
+            "queue": "default",
+        }
+
+        assert scheduler.complete(first_id)
+        second_task = asyncio.run(scheduler.dequeue())
+        assert second_task["id"] == second_id
+
+    def test_recovery_defers_over_capacity_tenant_tasks(self):
+        scheduler = TaskScheduler(max_concurrent_per_tenant=1)
+        recovered = [
+            {
+                "id": "run-1",
+                "type": "run",
+                "tenant_id": "tenant-a",
+                "state": "running",
+            },
+            {
+                "id": "run-2",
+                "type": "run",
+                "tenant_id": "tenant-a",
+                "state": "running",
+            },
+        ]
+
+        result = scheduler.recover_in_flight(recovered)
+
+        assert result == {"accepted": ["run-1"], "deferred": ["run-2"]}
+        assert scheduler._in_flight["run-1"] is recovered[0]
+        assert scheduler._recovery_deferred["run-2"] is recovered[1]
+        assert recovered[1]["state"] == "running"
+        assert "payload" not in scheduler.audit_log[-1]
+        assert scheduler.audit_log[-1] == {
+            "decision": "deferred",
+            "reason": "tenant_concurrency_limit",
+            "task_id": "run-2",
+            "tenant_id": "tenant-a",
+            "tenant_in_flight": 1,
+            "tenant_limit": 1,
+            "queue": "default",
+        }
 
 # 2019-01-09T19:07:03 update
 
