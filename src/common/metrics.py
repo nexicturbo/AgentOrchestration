@@ -1,17 +1,54 @@
 """Metrics collection and reporting."""
 
 import time
-from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from collections import defaultdict, deque
+from threading import RLock
+from typing import Deque, Dict, Optional
+
+
+DEFAULT_HISTOGRAM_SAMPLE_LIMIT = 1024
+
+
+class HistogramSummary:
+    def __init__(self, sample_limit: int):
+        self.count = 0
+        self.sum = 0.0
+        self.min: Optional[float] = None
+        self.max: Optional[float] = None
+        self.recent_samples: Deque[float] = deque(maxlen=sample_limit)
+        self.sample_limit = sample_limit
+
+    def observe(self, value: float) -> None:
+        self.count += 1
+        self.sum += value
+        self.min = value if self.min is None else min(self.min, value)
+        self.max = value if self.max is None else max(self.max, value)
+        self.recent_samples.append(value)
+
+    def snapshot(self) -> Dict:
+        return {
+            "count": self.count,
+            "sum": self.sum,
+            "avg": self.sum / self.count if self.count else 0,
+            "min": self.min,
+            "max": self.max,
+            "recent_samples": list(self.recent_samples),
+            "sample_limit": self.sample_limit,
+        }
 
 
 class MetricsCollector:
-    def __init__(self):
-        self._lock = Lock()
+    def __init__(
+        self,
+        histogram_sample_limit: int = DEFAULT_HISTOGRAM_SAMPLE_LIMIT,
+    ):
+        if histogram_sample_limit < 1:
+            raise ValueError("histogram_sample_limit must be at least 1")
+        self._lock = RLock()
+        self._histogram_sample_limit = histogram_sample_limit
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
-        self._histograms: Dict[str, List[float]] = defaultdict(list)
+        self._histograms: Dict[str, HistogramSummary] = {}
         self._timers: Dict[str, float] = {}
 
     def increment(self, metric: str, value: int = 1) -> None:
@@ -24,7 +61,11 @@ class MetricsCollector:
 
     def observe(self, metric: str, value: float) -> None:
         with self._lock:
-            self._histograms[metric].append(value)
+            histogram = self._histograms.get(metric)
+            if histogram is None:
+                histogram = HistogramSummary(self._histogram_sample_limit)
+                self._histograms[metric] = histogram
+            histogram.observe(value)
 
     def start_timer(self, metric: str) -> None:
         with self._lock:
@@ -43,8 +84,10 @@ class MetricsCollector:
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": {
+                    metric: histogram.snapshot()
+                    for metric, histogram in self._histograms.items()
+                },
             }
 
 
