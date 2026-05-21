@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,60 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_rejects_stale_completion_after_retry_requeues_task(self):
+        self.scheduler.enqueue({
+            "type": "test",
+            "payload": {"secret": "value"},
+        })
+        import asyncio
+        first = asyncio.run(self.scheduler.dequeue())
+        first_attempt = first["attempt"]
+        first_revision = first["revision"]
+
+        assert self.scheduler.fail(
+            first["id"],
+            attempt=first_attempt,
+            revision=first_revision,
+        )
+        second = asyncio.run(self.scheduler.dequeue())
+
+        assert second["id"] == first["id"]
+        assert second["attempt"] == first_attempt + 1
+        assert second["revision"] == first_revision + 1
+        assert not self.scheduler.complete(
+            first["id"],
+            attempt=first_attempt,
+            revision=first_revision,
+        )
+        assert self.scheduler.complete(
+            second["id"],
+            attempt=second["attempt"],
+            revision=second["revision"],
+        )
+        assert self.scheduler.audit_records()[-2]["reason"] == (
+            "complete_stale_attempt"
+        )
+        assert all(
+            "payload" not in record
+            for record in self.scheduler.audit_records()
+        )
+
+    def test_dequeue_skips_stale_queue_snapshot_without_dispatching(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        task = self.scheduler._tasks[task_id]
+        self.scheduler._queue_task(
+            {"id": task_id, "attempt": 0, "revision": task["revision"]},
+            "default",
+            priority=20,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert task["attempt"] == 1
+        assert self.scheduler.audit_records()[0]["reason"] == "stale_attempt"
 
 # 2019-01-09T19:07:03 update
 

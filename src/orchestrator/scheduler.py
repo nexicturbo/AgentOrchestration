@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -33,53 +32,246 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._tasks: Dict[str, Dict] = {}
+        self._audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
-
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        task_record = dict(task)
+        task_record.update({
+            "id": task_id,
+            "attempt": 1,
+            "revision": 1,
+            "state": "queued",
+            "queue": queue,
+            "priority": priority,
+            "enqueued_at": time.time(),
+            "retries": 0,
+        })
+        self._tasks[task_id] = task_record
+        self._queue_task(task_record, queue, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task_record = dict(task)
+        task_record.update({
+            "id": task_id,
+            "attempt": 1,
+            "revision": 1,
+            "state": "scheduled",
+            "queue": queue,
+            "priority": priority,
+            "scheduled_at": time.time(),
+            "retries": 0,
+        })
+        self._tasks[task_id] = task_record
+        self._scheduled[task_id] = {
+            "task": task_record,
+            "run_at": time.time() + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, item in self._scheduled.items()
+            if item["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            item = self._scheduled.pop(tid)
+            task = item["task"]
+            task["state"] = "queued"
+            self._queue_task(task, item["queue"], item["priority"])
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
-            if task:
+            while len(self._queues[queue]) > 0:
+                entry = self._queues[queue].pop()
+                task = self._tasks.get(entry["task_id"])
+                if self._reject_stale_queue_entry(entry, task):
+                    continue
+
+                task["state"] = "in_flight"
+                task["dispatched_at"] = time.time()
                 self._in_flight[task["id"]] = task
-                return task
+                return dict(task)
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def complete(
+        self,
+        task_id: str,
+        *,
+        attempt: Optional[int] = None,
+        revision: Optional[int] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not self._can_commit_transition(
+            task,
+            attempt,
+            revision,
+            "complete",
+        ):
+            return False
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
-        task = self._in_flight.pop(task_id, None)
-        if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+        self._in_flight.pop(task_id, None)
+        task["state"] = "completed"
+        task["completed_at"] = time.time()
+        self._record_audit("complete", task)
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        *,
+        attempt: Optional[int] = None,
+        revision: Optional[int] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        if not self._can_commit_transition(task, attempt, revision, "fail"):
+            return False
+
+        self._in_flight.pop(task_id, None)
+        task["retries"] += 1
+        if task["retries"] < self._max_retries:
+            task["attempt"] += 1
+            task["revision"] += 1
+            task["state"] = "queued"
+            self._queue_task(task, queue, task.get("priority", 0))
+            self._record_audit("retry_queued", task)
+            return True
+
+        task["state"] = "failed"
+        self._record_audit("failed", task)
         return False
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit)
+
+    def _queue_task(self, task: Dict, queue: str, priority: int) -> None:
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        task["queue"] = queue
+        task["priority"] = priority
+        self._queues[queue].push(
+            {
+                "task_id": task["id"],
+                "attempt": task["attempt"],
+                "revision": task["revision"],
+            },
+            priority,
+        )
+
+    def _reject_stale_queue_entry(
+        self,
+        entry: Dict,
+        task: Optional[Dict],
+    ) -> bool:
+        if not task:
+            self._record_audit("reject", None, reason="missing_task")
+            return True
+        if task["state"] != "queued":
+            self._record_audit(
+                "reject",
+                task,
+                reason="invalid_lifecycle",
+                entry=entry,
+            )
+            return True
+        if task["attempt"] != entry["attempt"]:
+            self._record_audit(
+                "reject",
+                task,
+                reason="stale_attempt",
+                entry=entry,
+            )
+            return True
+        if task["revision"] != entry["revision"]:
+            self._record_audit(
+                "reject",
+                task,
+                reason="stale_revision",
+                entry=entry,
+            )
+            return True
+        return False
+
+    def _can_commit_transition(
+        self,
+        task: Optional[Dict],
+        attempt: Optional[int],
+        revision: Optional[int],
+        action: str,
+    ) -> bool:
+        if not task:
+            self._record_audit("reject", None, reason=f"{action}_missing_task")
+            return False
+        if task["state"] != "in_flight":
+            self._record_audit(
+                "reject",
+                task,
+                reason=f"{action}_invalid_lifecycle",
+            )
+            return False
+        if attempt is not None and task["attempt"] != attempt:
+            self._record_audit(
+                "reject",
+                task,
+                reason=f"{action}_stale_attempt",
+                entry={"attempt": attempt},
+            )
+            return False
+        if revision is not None and task["revision"] != revision:
+            self._record_audit(
+                "reject",
+                task,
+                reason=f"{action}_stale_revision",
+                entry={"revision": revision},
+            )
+            return False
+        return True
+
+    def _record_audit(
+        self,
+        action: str,
+        task: Optional[Dict],
+        *,
+        reason: Optional[str] = None,
+        entry: Optional[Dict] = None,
+    ) -> None:
+        record: Dict[str, Any] = {
+            "action": action,
+            "reason": reason,
+            "task_id": task.get("id") if task else None,
+            "state": task.get("state") if task else None,
+            "attempt": task.get("attempt") if task else None,
+            "revision": task.get("revision") if task else None,
+        }
+        if entry:
+            record["entry_attempt"] = entry.get("attempt")
+            record["entry_revision"] = entry.get("revision")
+        self._audit.append(record)
 
 # 2019-04-25T08:37:12 update
 
