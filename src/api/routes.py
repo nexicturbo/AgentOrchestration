@@ -1,22 +1,32 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Body, Header, HTTPException
+from fastapi.responses import JSONResponse
+from typing import Any, Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.agent_config import AgentConfigService, AgentConfigUpdateError
 
 router = APIRouter()
 registry = AgentRegistry()
+config_service = AgentConfigService(registry)
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -27,6 +37,48 @@ async def get_agent(agent_id: str):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
+
+
+@router.get("/agents/{agent_id}/config")
+async def get_agent_config(
+    agent_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    try:
+        result = config_service.read_config(
+            agent_id=agent_id,
+            authorization=authorization,
+        )
+    except AgentConfigUpdateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+    return JSONResponse(
+        content={"agent_id": result["agent_id"], "config": result["config"]},
+        headers={"ETag": result["etag"]},
+    )
+
+
+@router.patch("/agents/{agent_id}/config")
+async def update_agent_config(
+    agent_id: str,
+    payload: Any = Body(...),
+    if_match: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None),
+):
+    try:
+        result = config_service.update_config(
+            agent_id=agent_id,
+            payload=payload,
+            if_match=if_match,
+            authorization=authorization,
+        )
+    except AgentConfigUpdateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+    return JSONResponse(
+        content={"agent_id": result["agent_id"], "config": result["config"]},
+        headers={"ETag": result["etag"]},
+    )
 
 
 @router.delete("/agents/{agent_id}")
