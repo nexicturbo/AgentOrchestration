@@ -1,11 +1,13 @@
 """Orchestration Engine — Core execution and coordination logic."""
 
 import asyncio
+import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.metrics import metrics
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
@@ -24,10 +26,36 @@ class OrchestrationEngine:
             "on_error": [],
             "on_complete": [],
         }
+        self._run_states: Dict[str, Dict[str, Any]] = {}
+        self._run_event_audit: List[Dict[str, Any]] = []
 
     def register_hook(self, event: str, callback: Callable) -> None:
         if event in self._hooks:
             self._hooks[event].append(callback)
+
+    def register_run(
+        self,
+        run_id: str,
+        *,
+        attempt: int = 0,
+        revision: int = 0,
+        lifecycle: str = "active",
+    ) -> None:
+        self._run_states[run_id] = {
+            "attempt": attempt,
+            "revision": revision,
+            "lifecycle": lifecycle,
+        }
+
+    def archive_run(self, run_id: str) -> None:
+        state = self._run_states.setdefault(
+            run_id,
+            {"attempt": 0, "revision": 0, "lifecycle": "active"},
+        )
+        state["lifecycle"] = "archived"
+
+    def run_event_audit(self) -> List[Dict[str, Any]]:
+        return list(self._run_event_audit)
 
     async def start(self) -> None:
         self._running = True
@@ -46,6 +74,13 @@ class OrchestrationEngine:
         task_id = task["id"]
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
+
+        if not self._accept_run_event(task):
+            logger.warning(
+                "Rejected stale or archived run event for task %s",
+                task_id,
+            )
+            return
 
         for hook in self._hooks["pre_execute"]:
             await hook(task)
@@ -82,7 +117,43 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
+
+    def _accept_run_event(self, task: Dict[str, Any]) -> bool:
+        run_id = task.get("run_id")
+        if run_id is None:
+            return True
+
+        state = self._run_states.get(run_id)
+        reason = None
+        if state is None:
+            reason = "unknown_run"
+        elif state["lifecycle"] != "active":
+            reason = "archived_run"
+        elif task.get("run_attempt") != state["attempt"]:
+            reason = "stale_attempt"
+        elif task.get("run_revision") != state["revision"]:
+            reason = "stale_revision"
+
+        if reason is None:
+            return True
+
+        metrics.increment("orchestrator.run_events.rejected")
+        metrics.increment(f"orchestrator.run_events.rejected.{reason}")
+        self._run_event_audit.append({
+            "decision": "rejected",
+            "reason": reason,
+            "run": self._hash_ref(run_id),
+            "task": self._hash_ref(task.get("id")),
+        })
+        return False
+
+    @staticmethod
+    def _hash_ref(value: Any) -> str:
+        return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
 
 # 2019-04-24T14:55:39 update
 
