@@ -1,31 +1,86 @@
 """CLI entry point for the agent orchestrator."""
 
 import argparse
+import json
 import sys
 
-from src.common.config import Config
 from src.common.logging import configure_logging
+from src.orchestrator.deployment import (
+    DeploymentMigrationGate,
+    MigrationCheck,
+    MigrationFailed,
+    ReleasePlan,
+)
+
+
+def _load_release_plan(path: str) -> ReleasePlan:
+    with open(path) as f:
+        data = json.load(f)
+
+    migrations = [
+        MigrationCheck(
+            name=item["name"],
+            backward_compatible=item.get("backward_compatible", True),
+            reversible=item.get("reversible", True),
+        )
+        for item in data.get("migrations", [])
+    ]
+    return ReleasePlan(
+        previous_version=data.get("previous_version", "current"),
+        target_version=data["target_version"],
+        migrations=tuple(migrations),
+        reversible=data.get("reversible", True),
+    )
+
+
+def _run_manifest_migrations(plan: ReleasePlan) -> None:
+    for migration in plan.migrations:
+        if migration.name.startswith("fail:"):
+            message = f"migration failed: {migration.name}"
+            raise MigrationFailed(message)
 
 
 def cli():
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
 
     args = parser.parse_args()
 
@@ -37,7 +92,24 @@ def cli():
     if args.command == "init":
         print(f"Initializing project: {args.name}")
     elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
+        plan = _load_release_plan(args.manifest)
+        gate = DeploymentMigrationGate()
+        decision = gate.evaluate_rollout(plan, _run_manifest_migrations)
+        if not decision.allowed:
+            print(
+                f"Rollout blocked; serving {decision.serving_version}. "
+                f"Migration status: {decision.migration_status.value}"
+            )
+            for issue in decision.compatibility.issues:
+                print(f"- {issue}")
+            if decision.migration_error:
+                print(f"- {decision.migration_error}")
+            sys.exit(2)
+        print(
+            f"Deploying {plan.target_version}; "
+            f"migrations {decision.migration_status.value}; "
+            f"traffic shifted to {decision.traffic_version}"
+        )
     elif args.command == "status":
         print("Checking agent status...")
     elif args.command == "logs":
