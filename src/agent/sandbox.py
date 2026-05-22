@@ -17,7 +17,25 @@ def _validate_limit(name: str, value: int) -> int:
     return int(value)
 
 
+def _coerce_config_limit(name: str, value) -> int:
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            raise ValueError(f"{name} must be a positive number")
+        try:
+            value = int(value)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive number") from exc
+    return _validate_limit(name, value)
+
+
 class ResourceLimits:
+    DEFAULTS = {
+        "cpu_time": 60,
+        "memory_mb": 512,
+        "disk_mb": 100,
+    }
+
     def __init__(
         self,
         cpu_time: int = 60,
@@ -27,6 +45,24 @@ class ResourceLimits:
         self.cpu_time = _validate_limit("cpu_time", cpu_time)
         self.memory_mb = _validate_limit("memory_mb", memory_mb)
         self.disk_mb = _validate_limit("disk_mb", disk_mb)
+
+    @classmethod
+    def from_config(cls, config, prefix: str = "sandbox") -> "ResourceLimits":
+        values = {
+            name: config.get(f"{prefix}.{name}", default)
+            for name, default in cls.DEFAULTS.items()
+        }
+        return cls(
+            cpu_time=_coerce_config_limit(
+                f"{prefix}.cpu_time", values["cpu_time"]
+            ),
+            memory_mb=_coerce_config_limit(
+                f"{prefix}.memory_mb", values["memory_mb"]
+            ),
+            disk_mb=_coerce_config_limit(
+                f"{prefix}.disk_mb", values["disk_mb"]
+            ),
+        )
 
 
 class AgentSandbox:
