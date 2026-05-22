@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  agent-worker:
+    image: python:3.11-slim
+    working_dir: /workspace
+    command: ["python", "-c", "import time; time.sleep(3600)"]
+    volumes:
+      - ..:/workspace:ro
+    environment:
+      AO_ENV: development
+
+  metrics-sidecar:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - "mkdir -p /tmp/ao-metrics && while true; do date > /tmp/ao-metrics/heartbeat; sleep 60; done"
+    depends_on:
+      - agent-worker
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      ao.role: sidecar
+      ao.writable-paths: /tmp
+
+  log-forwarder-sidecar:
+    image: busybox:1.36
+    command:
+      - sh
+      - -c
+      - "mkdir -p /tmp/ao-logs && while true; do date > /tmp/ao-logs/heartbeat; sleep 60; done"
+    depends_on:
+      - agent-worker
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      ao.role: sidecar
+      ao.writable-paths: /tmp
