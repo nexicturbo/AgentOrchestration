@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,42 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_init_owns_nested_config_data(self):
+        source = {"app": {"features": ["a"]}}
+        config = Config(data=source)
+
+        source["app"]["features"].append("b")
+
+        assert config.get("app.features") == ["a"]
+
+    def test_load_dict_replaces_with_owned_nested_copy(self):
+        source = {"database": {"hosts": ["primary"]}}
+        config = Config()
+        config.load_dict(source)
+
+        source["database"]["hosts"].append("replica")
+
+        assert config.get("database.hosts") == ["primary"]
+
+    def test_set_owns_nested_value_data(self):
+        value = {"roles": ["reader"]}
+        config = Config()
+
+        config.set("auth.policy", value)
+        value["roles"].append("admin")
+
+        assert config.get("auth.policy") == {"roles": ["reader"]}
+
+    def test_get_and_to_dict_return_owned_snapshots(self):
+        config = Config(data={"audit": {"enabled": True, "sinks": ["file"]}})
+
+        audit = config.get("audit")
+        audit["sinks"].append("network")
+        exported = config.to_dict()
+        exported["audit"]["enabled"] = False
+
+        assert config.get("audit") == {"enabled": True, "sinks": ["file"]}
 
 # 2019-02-01T18:58:35 update
 
