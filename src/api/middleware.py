@@ -1,18 +1,140 @@
 """API middleware components."""
 
+import asyncio
+import contextvars
 import time
 import logging
 from typing import Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import PlainTextResponse, Response
 
 logger = logging.getLogger(__name__)
+_timeout_state = contextvars.ContextVar("request_timeout_state", default=None)
+
+
+def get_request_timeout_state():
+    return _timeout_state.get()
+
+
+class TimeoutMiddleware:
+    def __init__(self, app, timeout_seconds: float = 30.0):
+        self.app = app
+        self.timeout_seconds = timeout_seconds
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        state = {"active": True, "timed_out": False}
+        token = _timeout_state.set(state)
+        response_started = False
+        response_start = None
+
+        async def guarded_send(message):
+            nonlocal response_started, response_start
+            if message["type"] == "http.response.start":
+                response_start = self._with_timeout_headers(
+                    message,
+                    status="enforced",
+                )
+                return
+
+            if message["type"] == "http.response.body":
+                if response_start is not None and not response_started:
+                    await send(response_start)
+                    response_started = True
+                await send(message)
+                return
+
+            await send(message)
+
+        try:
+            await asyncio.wait_for(
+                self.app(scope, receive, guarded_send),
+                timeout=self.timeout_seconds,
+            )
+            if response_start is not None and not response_started:
+                await send(response_start)
+                await send({"type": "http.response.body", "body": b""})
+        except asyncio.TimeoutError:
+            state["timed_out"] = True
+            self._clear_timeout_state(token, state)
+            logger.warning(
+                "request timeout method=%s path=%s timeout=%.3fs",
+                scope.get("method", ""),
+                scope.get("path", ""),
+                self.timeout_seconds,
+            )
+            if response_started:
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b"",
+                        "more_body": False,
+                    }
+                )
+                return
+
+            response = PlainTextResponse(
+                "Request timed out",
+                status_code=504,
+                headers={
+                    "X-Request-Timeout": "exceeded",
+                    "X-Request-Timeout-Cleared": "true",
+                },
+            )
+            await response(scope, receive, send)
+        except Exception as exc:
+            self._clear_timeout_state(token, state)
+            logger.error(
+                "request failed method=%s path=%s error_type=%s",
+                scope.get("method", ""),
+                scope.get("path", ""),
+                type(exc).__name__,
+            )
+            if response_started:
+                raise
+
+            response = PlainTextResponse(
+                "Internal Server Error",
+                status_code=500,
+                headers={
+                    "X-Request-Timeout": "error",
+                    "X-Request-Timeout-Cleared": "true",
+                },
+            )
+            await response(scope, receive, send)
+        finally:
+            if get_request_timeout_state() is state:
+                self._clear_timeout_state(token, state)
+
+    def _clear_timeout_state(self, token, state) -> None:
+        state["active"] = False
+        _timeout_state.reset(token)
+
+    def _with_timeout_headers(self, message, status: str):
+        headers = list(message.get("headers", []))
+        headers.extend(
+            [
+                (b"x-request-timeout", status.encode("ascii")),
+                (b"x-request-timeout-cleared", b"true"),
+            ]
+        )
+        return {**message, "headers": headers}
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +148,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +171,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
