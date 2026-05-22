@@ -10,6 +10,37 @@ class TestConfig:
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
 
+    def test_load_rejects_array_root(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('[{"app": "test"}]')
+        config = Config()
+
+        with pytest.raises(
+            ValueError,
+            match="Config root must be a JSON object",
+        ):
+            config.load(str(config_file))
+
+        assert config.to_dict() == {}
+
+    def test_load_rejects_scalar_root_without_replacing_current_config(
+        self,
+        tmp_path,
+    ):
+        valid_config = tmp_path / "valid.json"
+        valid_config.write_text('{"app": {"name": "test"}}')
+        invalid_config = tmp_path / "invalid.json"
+        invalid_config.write_text('"not-an-object"')
+        config = Config(str(valid_config))
+
+        with pytest.raises(
+            ValueError,
+            match="Config root must be a JSON object",
+        ):
+            config.load(str(invalid_config))
+
+        assert config.get("app.name") == "test"
+
     def test_default_value(self):
         config = Config()
         assert config.get("nonexistent.key", "default") == "default"
