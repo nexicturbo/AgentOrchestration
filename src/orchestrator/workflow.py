@@ -5,6 +5,10 @@ from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
+class WorkflowValidationError(ValueError):
+    """Raised when workflow registration would create an invalid graph."""
+
+
 class StepStatus(Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -14,15 +18,33 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        dependencies: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.dependencies = list(dependencies or [])
+        self.normalized_name = ""
+        self.normalized_dependencies: List[str] = []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+
+
+def _normalize_identifier(identifier: str) -> str:
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise WorkflowValidationError(
+            "workflow dependency identifiers must be non-empty strings"
+        )
+    return identifier.strip().casefold()
 
 
 class Workflow:
@@ -32,15 +54,78 @@ class Workflow:
         self.description = description
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
+        self._normalized_step_map: Dict[str, WorkflowStep] = {}
+        self._dependency_targets: Dict[str, WorkflowStep] = {}
+        self.audit_events: List[Dict[str, str]] = []
         self.status = StepStatus.PENDING
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        normalized_name = _normalize_identifier(step.name)
+        if normalized_name in self._normalized_step_map:
+            self._audit_registration_rejection(
+                "duplicate_step_identifier",
+                normalized_name,
+            )
+            raise WorkflowValidationError(
+                f"duplicate workflow step identifier: {normalized_name}"
+            )
+
+        normalized_dependencies = self._normalize_dependencies(step)
+        step.normalized_name = normalized_name
+        step.normalized_dependencies = normalized_dependencies
         self.steps.append(step)
         self._step_map[step.id] = step
+        self._normalized_step_map[normalized_name] = step
+        self._dependency_targets[_normalize_identifier(step.id)] = step
+        self._dependency_targets[normalized_name] = step
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def _normalize_dependencies(self, step: WorkflowStep) -> List[str]:
+        normalized_dependencies = []
+        seen = set()
+        for dependency in step.dependencies:
+            normalized_dependency = _normalize_identifier(dependency)
+            if normalized_dependency in seen:
+                self._audit_registration_rejection(
+                    "duplicate_dependency_identifier",
+                    _normalize_identifier(step.name),
+                    normalized_dependency,
+                )
+                raise WorkflowValidationError(
+                    f"duplicate dependency identifier: {normalized_dependency}"
+                )
+            if normalized_dependency not in self._dependency_targets:
+                self._audit_registration_rejection(
+                    "unknown_dependency_identifier",
+                    _normalize_identifier(step.name),
+                    normalized_dependency,
+                )
+                raise WorkflowValidationError(
+                    f"unknown dependency identifier: {normalized_dependency}"
+                )
+            seen.add(normalized_dependency)
+            normalized_dependencies.append(normalized_dependency)
+        return normalized_dependencies
+
+    def _audit_registration_rejection(
+        self,
+        reason: str,
+        step_identifier: str,
+        dependency_identifier: Optional[str] = None,
+    ) -> None:
+        event = {
+            "event": "workflow_step_rejected",
+            "reason": reason,
+            "workflow_id": self.id,
+            "workflow_status": self.status.value,
+            "step_identifier": step_identifier,
+        }
+        if dependency_identifier is not None:
+            event["dependency_identifier"] = dependency_identifier
+        self.audit_events.append(event)
 
 
 class WorkflowManager:
