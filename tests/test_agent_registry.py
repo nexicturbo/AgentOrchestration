@@ -1,5 +1,10 @@
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+
+from src.agent.registry import (
+    AgentRegistry,
+    AgentStatus,
+    IncompatibleProtocolError,
+)
 
 
 class TestAgentRegistry:
@@ -47,6 +52,68 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_rejects_incompatible_protocol_upgrade_before_commit(self):
+        agent_id = self.registry.register(
+            "processor-v1",
+            "worker.processor",
+            {"protocol_version": "1.2"},
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        with pytest.raises(
+            IncompatibleProtocolError,
+            match="incompatible protocol",
+        ):
+            self.registry.register(
+                "processor-v2",
+                "worker.processor",
+                {"protocol_version": "2.0"},
+            )
+
+        assert self.registry.count() == 1
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+        assert agent["protocol_version"] == "1.2"
+        assert self.registry.audit_log()[-1] == {
+            "action": "register",
+            "decision": "rejected_incompatible_protocol",
+            "agent_group": "worker",
+            "protocol_major": 2,
+        }
+
+    def test_compatible_registration_invalidates_resolution_cache(self):
+        first = self.registry.register(
+            "processor-v1",
+            "worker.processor",
+            {"protocol_version": "1.0"},
+        )
+        assert self.registry.resolve("worker.processor", "1.0")["id"] == first
+
+        second = self.registry.register(
+            "processor-v1.1",
+            "worker.processor",
+            {"protocol_version": "1.1"},
+        )
+
+        resolved = self.registry.resolve("worker.processor", "1.0")
+        assert resolved["id"] == second
+        assert resolved["protocol_version"] == "1.1"
+
+    def test_resolution_defers_incompatible_protocol_requests(self):
+        self.registry.register(
+            "processor-v1",
+            "worker.processor",
+            {"protocol_version": "1.0"},
+        )
+
+        assert self.registry.resolve("worker.processor", "2.0") is None
+        assert self.registry.audit_log()[-1] == {
+            "action": "resolve",
+            "decision": "rejected",
+            "agent_group": "worker",
+            "protocol_major": 2,
+        }
 
 # 2019-01-23T10:28:57 update
 
