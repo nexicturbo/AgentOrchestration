@@ -1,7 +1,7 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import hashlib
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -31,30 +31,68 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, max_capacity: Optional[int] = None):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._max_capacity = max_capacity
+        self._reserved_capacity: Dict[str, int] = {}
+        self._transactions: Dict[str, str] = {}
+        self.capacity_audit = []
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+        transaction_id: Optional[str] = None,
+    ) -> str:
+        if transaction_id and transaction_id in self._transactions:
+            task_id = self._transactions[transaction_id]
+            self._audit_capacity(queue, "idempotent", task_id)
+            return task_id
+
+        self._reserve_capacity(queue)
         task_id = str(uuid4())
-        task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        queued_task = dict(task)
+        queued_task["id"] = task_id
+        queued_task["enqueued_at"] = time.time()
+        queued_task["retries"] = task.get("retries", 0)
+        queued_task["priority"] = priority
+        queued_task["queue"] = queue
 
-        if queue not in self._queues:
-            self._queues[queue] = PriorityQueue()
-        self._queues[queue].push(task, priority)
+        try:
+            if queue not in self._queues:
+                self._queues[queue] = PriorityQueue()
+            self._queues[queue].push(queued_task, priority)
+        except Exception:
+            self._release_capacity(queue)
+            self._audit_capacity(queue, "rolled_back", task_id)
+            raise
+
+        if transaction_id:
+            self._transactions[transaction_id] = task_id
+        self._audit_capacity(queue, "accepted", task_id)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -70,16 +108,59 @@ class TaskScheduler:
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task is None:
+            return False
+        self._release_capacity(task.get("queue", "default"))
+        return True
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
+                self._release_capacity(task.get("queue", queue))
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
+            self._release_capacity(task.get("queue", queue))
         return False
+
+    def reserved_capacity(self, queue: str = "default") -> int:
+        return self._reserved_capacity.get(queue, 0)
+
+    def _reserve_capacity(self, queue: str) -> None:
+        current = self._reserved_capacity.get(queue, 0)
+        if self._max_capacity is not None and current >= self._max_capacity:
+            self._audit_capacity(queue, "rejected", None)
+            raise ValueError("queue capacity exceeded")
+        self._reserved_capacity[queue] = current + 1
+
+    def _release_capacity(self, queue: str) -> None:
+        current = self._reserved_capacity.get(queue, 0)
+        if current <= 1:
+            self._reserved_capacity.pop(queue, None)
+        else:
+            self._reserved_capacity[queue] = current - 1
+
+    def _audit_capacity(
+        self,
+        queue: str,
+        decision: str,
+        task_id: Optional[str],
+    ) -> None:
+        self.capacity_audit.append(
+            {
+                "queue": hashlib.sha256(
+                    queue.encode("utf-8")
+                ).hexdigest()[:12],
+                "decision": decision,
+                "task": self._digest(task_id) if task_id else "",
+                "reserved": self._reserved_capacity.get(queue, 0),
+            }
+        )
+
+    def _digest(self, value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 # 2019-04-25T08:37:12 update
 

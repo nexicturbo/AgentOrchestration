@@ -1,5 +1,5 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import PriorityQueue, TaskScheduler
 
 
 class TestTaskScheduler:
@@ -35,6 +35,70 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_enqueue_rolls_back_reserved_capacity_on_queue_failure(self):
+        scheduler = TaskScheduler(max_capacity=1)
+        scheduler._queues["default"] = BrokenQueue()
+
+        with pytest.raises(RuntimeError, match="push failed"):
+            scheduler.enqueue({"type": "test"})
+
+        assert scheduler.reserved_capacity() == 0
+        assert scheduler.capacity_audit[-1]["decision"] == "rolled_back"
+        assert "payload" not in scheduler.capacity_audit[-1]
+
+        scheduler._queues["default"] = PriorityQueue()
+        task_id = scheduler.enqueue({"type": "next"})
+        assert task_id is not None
+        assert scheduler.reserved_capacity() == 1
+
+    def test_enqueue_rejects_over_capacity_before_queue_mutation(self):
+        scheduler = TaskScheduler(max_capacity=1)
+        scheduler.enqueue({"type": "first"})
+
+        with pytest.raises(ValueError, match="queue capacity exceeded"):
+            scheduler.enqueue({"type": "second"})
+
+        assert scheduler.reserved_capacity() == 1
+        assert scheduler.capacity_audit[-1]["decision"] == "rejected"
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+        assert task["type"] == "first"
+        assert asyncio.run(scheduler.dequeue()) is None
+
+    def test_enqueue_transaction_id_is_idempotent(self):
+        scheduler = TaskScheduler(max_capacity=2)
+
+        first = scheduler.enqueue({"type": "once"}, transaction_id="txn-1")
+        second = scheduler.enqueue({"type": "once"}, transaction_id="txn-1")
+
+        assert second == first
+        assert scheduler.reserved_capacity() == 1
+        assert scheduler.capacity_audit[-1]["decision"] == "idempotent"
+        import asyncio
+        assert asyncio.run(scheduler.dequeue())["id"] == first
+        assert asyncio.run(scheduler.dequeue()) is None
+
+    def test_capacity_released_after_completion_and_retry_failure(self):
+        scheduler = TaskScheduler(max_capacity=1)
+        first = scheduler.enqueue({"type": "first"})
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.complete(task["id"])
+        assert scheduler.reserved_capacity() == 0
+
+        second = scheduler.enqueue({"type": "retry"})
+        task = asyncio.run(scheduler.dequeue())
+        task["retries"] = scheduler._max_retries - 1
+        assert not scheduler.fail(task["id"])
+        assert scheduler.reserved_capacity() == 0
+        assert first != second
+
+
+class BrokenQueue:
+    def push(self, item, priority=0):
+        raise RuntimeError("push failed")
 
 # 2019-01-09T19:07:03 update
 
