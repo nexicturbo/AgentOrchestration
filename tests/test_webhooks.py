@@ -43,13 +43,16 @@ def create_subscription(
     workspace_id="workspace-a",
     event_types=None,
     enabled=True,
+    endpoint=None,
 ):
     response = client.post(
         "/api/v2/webhooks/subscriptions",
         headers=AUTH_HEADERS,
         json={
             "workspace_id": workspace_id,
-            "endpoint": f"https://hooks.example.com/{workspace_id}",
+            "endpoint": (
+                endpoint or f"https://hooks.example.com/{workspace_id}"
+            ),
             "event_types": event_types or ["task.completed"],
             "enabled": enabled,
         },
@@ -78,6 +81,70 @@ def test_subscription_create_rejects_event_type_before_persistence(client):
         params={"workspace_id": "workspace-a"},
     )
     assert response.json() == {"subscriptions": []}
+
+
+def test_subscription_create_normalizes_endpoint_before_duplicate_check(
+    client,
+):
+    first = create_subscription(
+        client,
+        endpoint="https://Hooks.Example.com:443/workspace-a/?b=2&a=1#frag",
+    )
+    second = create_subscription(
+        client,
+        endpoint="https://hooks.example.com/workspace-a?a=1&b=2",
+    )
+    other_workspace = create_subscription(
+        client,
+        workspace_id="workspace-b",
+        endpoint="https://hooks.example.com/workspace-a?a=1&b=2",
+    )
+
+    assert second == first
+    assert (
+        first["endpoint"]
+        == "https://hooks.example.com/workspace-a?a=1&b=2"
+    )
+    assert other_workspace["id"] != first["id"]
+
+    response = client.get(
+        "/api/v2/webhooks/subscriptions",
+        headers=AUTH_HEADERS,
+        params={"workspace_id": "workspace-a"},
+    )
+    assert response.json()["subscriptions"] == [first]
+
+
+def test_disabled_normalized_endpoint_replacement_skips_duplicate_delivery(
+    client,
+):
+    disabled = create_subscription(
+        client,
+        enabled=False,
+        endpoint="https://hooks.example.com/workspace-a/",
+    )
+    replacement = create_subscription(
+        client,
+        endpoint="https://HOOKS.example.com:443/workspace-a",
+    )
+
+    assert replacement["id"] != disabled["id"]
+
+    delivery = client.post(
+        "/api/v2/webhooks/deliveries",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "event_type": "task.completed",
+            "delivery_id": "delivery-normalized",
+            "payload": {},
+        },
+    )
+
+    assert [
+        record["subscription_id"]
+        for record in delivery.json()["deliveries"]
+    ] == [replacement["id"]]
 
 
 @pytest.mark.parametrize(
@@ -363,6 +430,45 @@ def test_delivery_respects_workspace_and_disabled_subscription_scope(client):
         delivery["subscription_id"]
         for delivery in response_b.json()["deliveries"]
     ] == [workspace_b["id"]]
+
+
+def test_rotate_rejects_normalized_duplicate_endpoint_before_overwrite(client):
+    original = create_subscription(
+        client,
+        endpoint="https://hooks.example.com/original",
+    )
+    existing = create_subscription(
+        client,
+        endpoint="https://hooks.example.com/target?a=1&b=2",
+    )
+
+    response = client.post(
+        f"/api/v2/webhooks/subscriptions/{original['id']}/rotate",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "endpoint": "https://HOOKS.example.com:443/target/?b=2&a=1#frag",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "endpoint already registered" in response.json()["detail"]
+
+    delivery = client.post(
+        "/api/v2/webhooks/deliveries",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "event_type": "task.completed",
+            "delivery_id": "delivery-duplicate-rotate",
+            "payload": {},
+        },
+    )
+
+    assert [
+        record["subscription_id"]
+        for record in delivery.json()["deliveries"]
+    ] == [original["id"], existing["id"]]
 
 
 def test_rotated_subscription_versions_delivery_idempotency(client):

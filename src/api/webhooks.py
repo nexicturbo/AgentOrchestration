@@ -1,7 +1,7 @@
 """Webhook subscription and delivery API."""
 
-from typing import Any, Dict, List, Tuple
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException, status, Cookie
@@ -66,17 +66,28 @@ class WebhookService:
     ) -> Dict[str, Any]:
         event_types = self._validated_event_types(request.event_types)
         self._validate_workspace_id(request.workspace_id)
-        self._validate_endpoint(request.endpoint)
+        endpoint = self._normalized_endpoint(request.endpoint)
+
+        existing = self._find_subscription_by_endpoint(
+            request.workspace_id,
+            endpoint,
+        )
+        if (
+            existing is not None
+            and (existing["enabled"] or not request.enabled)
+        ):
+            return self._public_subscription(existing)
 
         subscription_id = str(uuid4())
         subscription = {
             "id": subscription_id,
             "workspace_id": request.workspace_id,
-            "endpoint": request.endpoint,
+            "endpoint": endpoint,
             "event_types": event_types,
             "enabled": request.enabled,
             "_secret_version": 1,
             "_delivery_count": 0,
+            "_endpoint_key": endpoint,
         }
         self._subscriptions[subscription_id] = subscription
         return self._public_subscription(subscription)
@@ -94,7 +105,7 @@ class WebhookService:
         request: WebhookSubscriptionRotate,
     ) -> Dict[str, Any]:
         self._validate_workspace_id(request.workspace_id)
-        self._validate_endpoint(request.endpoint)
+        endpoint = self._normalized_endpoint(request.endpoint)
 
         subscription = self._subscriptions.get(subscription_id)
         if (
@@ -103,7 +114,16 @@ class WebhookService:
         ):
             raise ValueError("webhook subscription not found")
 
-        subscription["endpoint"] = request.endpoint
+        existing = self._find_subscription_by_endpoint(
+            request.workspace_id,
+            endpoint,
+            exclude_subscription_id=subscription_id,
+        )
+        if existing is not None and (existing["enabled"] or request.enabled):
+            raise ValueError("webhook endpoint already registered")
+
+        subscription["endpoint"] = endpoint
+        subscription["_endpoint_key"] = endpoint
         subscription["enabled"] = request.enabled
         subscription["_secret_version"] += 1
         return self._public_subscription(subscription)
@@ -179,6 +199,22 @@ class WebhookService:
             and event_type in subscription["event_types"]
         ]
 
+    def _find_subscription_by_endpoint(
+        self,
+        workspace_id: str,
+        endpoint: str,
+        exclude_subscription_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        for subscription in self._subscriptions.values():
+            if subscription["id"] == exclude_subscription_id:
+                continue
+            if (
+                subscription["workspace_id"] == workspace_id
+                and subscription["_endpoint_key"] == endpoint
+            ):
+                return subscription
+        return None
+
     def _build_delivery_record(
         self,
         request: WebhookDeliveryCreate,
@@ -227,12 +263,29 @@ class WebhookService:
         if not workspace_id:
             raise ValueError("workspace_id is required")
 
-    def _validate_endpoint(self, endpoint: str) -> None:
+    def _normalized_endpoint(self, endpoint: str) -> str:
         parsed = urlparse(endpoint)
-        if parsed.scheme != "https" or not parsed.netloc:
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname.lower() if parsed.hostname else ""
+        if scheme != "https" or not hostname:
             raise ValueError("webhook endpoint must be an https URL")
-        if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+        if hostname in {"localhost", "127.0.0.1", "::1"}:
             raise ValueError("webhook endpoint must not target local hosts")
+
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("webhook endpoint must be an https URL")
+
+        netloc = f"[{hostname}]" if ":" in hostname else hostname
+        if port is not None and port != 443:
+            netloc = f"{netloc}:{port}"
+
+        path = parsed.path.rstrip("/")
+        query = urlencode(
+            sorted(parse_qsl(parsed.query, keep_blank_values=True))
+        )
+        return urlunparse((scheme, netloc, path, "", query, ""))
 
     def _public_subscription(
         self,
