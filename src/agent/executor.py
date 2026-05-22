@@ -2,18 +2,35 @@
 
 import asyncio
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Union
 from uuid import uuid4
 
 
 class AgentExecutor:
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(
+        self,
+        max_concurrent: int = 5,
+        max_results: int = 1000,
+        result_ttl_seconds: Optional[Union[int, float]] = None,
+    ):
+        if max_results < 1:
+            raise ValueError("max_results must be at least 1")
+        if result_ttl_seconds is not None and result_ttl_seconds < 0:
+            raise ValueError("result_ttl_seconds must be non-negative")
         self.max_concurrent = max_concurrent
+        self.max_results = max_results
+        self.result_ttl_seconds = result_ttl_seconds
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
+        self._result_stored_at: Dict[str, float] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self,
+        agent_id: str,
+        task: Dict[str, Any],
+        handler: Callable,
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -22,14 +39,20 @@ class AgentExecutor:
             self._active_tasks[execution_id] = task_obj
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                self._store_result(execution_id, result)
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._store_result(execution_id, {"error": str(e)})
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self,
+        exec_id: str,
+        agent_id: str,
+        task: Dict,
+        handler: Callable,
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
@@ -43,7 +66,31 @@ class AgentExecutor:
         }
 
     def get_result(self, execution_id: str) -> Optional[Any]:
+        self._cleanup_results()
         return self._results.get(execution_id)
+
+    def _store_result(self, execution_id: str, result: Any) -> None:
+        now = time.time()
+        self._cleanup_results(now)
+        self._results[execution_id] = result
+        self._result_stored_at[execution_id] = now
+        while len(self._results) > self.max_results:
+            oldest_id = next(iter(self._results))
+            self._results.pop(oldest_id, None)
+            self._result_stored_at.pop(oldest_id, None)
+
+    def _cleanup_results(self, now: Optional[float] = None) -> None:
+        if self.result_ttl_seconds is None:
+            return
+        current_time = time.time() if now is None else now
+        expired_ids = [
+            execution_id
+            for execution_id, stored_at in self._result_stored_at.items()
+            if current_time - stored_at >= self.result_ttl_seconds
+        ]
+        for execution_id in expired_ids:
+            self._results.pop(execution_id, None)
+            self._result_stored_at.pop(execution_id, None)
 
     def cancel(self, execution_id: str) -> bool:
         task = self._active_tasks.get(execution_id)
@@ -56,7 +103,10 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(),
+                return_exceptions=True,
+            )
 
 # 2019-01-31T14:19:34 update
 
