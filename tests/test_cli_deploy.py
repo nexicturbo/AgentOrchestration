@@ -53,6 +53,33 @@ def test_deploy_dry_run_rejects_missing_manifest(capsys, monkeypatch):
     assert "Deploying agent" not in captured.out
 
 
+def test_normal_deploy_rejects_missing_manifest_before_progress(
+    capsys,
+    monkeypatch,
+):
+    deployed = []
+
+    def fake_deploy(path, data):
+        deployed.append((path, data))
+
+    monkeypatch.setattr(main, "_deploy_agent", fake_deploy)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["ao", "deploy", "/tmp/does-not-exist.yaml"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main.cli()
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 2
+    assert deployed == []
+    assert "Invalid deployment manifest" in captured.err
+    assert "Manifest not found" in captured.err
+    assert "Deploying agent" not in captured.out
+
+
 def test_deploy_dry_run_rejects_non_mapping_manifest(
     tmp_path,
     capsys,
