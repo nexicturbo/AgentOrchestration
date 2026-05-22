@@ -1,8 +1,16 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
+import re
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+TEMPLATE_PATTERN = re.compile(
+    r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}"
+    r"|\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
+)
 
 
 class StepStatus(Enum):
@@ -14,12 +22,21 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        parameters: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.parameters = dict(parameters or {})
+        self.bound_parameters: Dict[str, Any] = {}
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,6 +50,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -61,16 +79,31 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
-    def execute_workflow(self, workflow_id: str) -> bool:
+    def execute_workflow(
+        self,
+        workflow_id: str,
+        runtime_parameters: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
+            return False
+
+        bindings = self._bind_workflow_parameters(
+            workflow,
+            runtime_parameters or {},
+        )
+        if bindings is None:
             return False
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
-                result = step.handler()
+                step.bound_parameters = dict(bindings[step.id])
+                if step.bound_parameters:
+                    result = step.handler(**step.bound_parameters)
+                else:
+                    result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
@@ -81,6 +114,71 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _bind_workflow_parameters(
+        self,
+        workflow: Workflow,
+        runtime_parameters: Dict[str, Any],
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        bindings = {}
+        for step in workflow.steps:
+            bound = _bind_parameters(step.parameters, runtime_parameters)
+            if bound is None:
+                step.error = "Unresolved template variable"
+                workflow.audit_records.append({
+                    "decision": "template_binding_rejected",
+                    "reason": "unresolved_template",
+                    "workflow_id": workflow.id,
+                    "step_id": step.id,
+                    "step_name": step.name,
+                })
+                logger.warning(
+                    "Rejected workflow step with unresolved template parameter"
+                )
+                return None
+            bindings[step.id] = bound
+        return bindings
+
+
+def _bind_parameters(
+    value: Any,
+    runtime_parameters: Dict[str, Any],
+) -> Optional[Any]:
+    if isinstance(value, dict):
+        bound = {}
+        for key, item in value.items():
+            bound_item = _bind_parameters(item, runtime_parameters)
+            if bound_item is None:
+                return None
+            bound[key] = bound_item
+        return bound
+
+    if isinstance(value, list):
+        bound = []
+        for item in value:
+            bound_item = _bind_parameters(item, runtime_parameters)
+            if bound_item is None:
+                return None
+            bound.append(bound_item)
+        return bound
+
+    if not isinstance(value, str):
+        return value
+
+    missing = False
+
+    def replace(match: re.Match) -> str:
+        nonlocal missing
+        name = match.group(1) or match.group(2)
+        if name not in runtime_parameters:
+            missing = True
+            return ""
+        return str(runtime_parameters[name])
+
+    rendered = TEMPLATE_PATTERN.sub(replace, value)
+    if missing or TEMPLATE_PATTERN.search(rendered):
+        return None
+    return rendered
 
 # 2019-03-27T19:58:07 update
 
