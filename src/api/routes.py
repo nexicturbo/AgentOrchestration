@@ -1,22 +1,36 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, HTTPException, Request
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.collaboration import (
+    CollaborationAuthorizationError,
+    CollaborationPermissionService,
+    SavedViewSharingService,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+collaboration_permissions = CollaborationPermissionService()
+saved_view_sharing = SavedViewSharingService(collaboration_permissions)
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +67,32 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/saved-views/{view_id}/share")
+async def share_saved_view(
+    view_id: str,
+    workspace_id: str,
+    target_workspace_id: str,
+    request: Request,
+):
+    try:
+        record = saved_view_sharing.share_view(
+            view_id,
+            workspace_id,
+            target_workspace_id,
+            request.headers,
+            request.cookies,
+        )
+    except CollaborationAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    return {
+        "view_id": record.view_id,
+        "source_workspace_id": record.source_workspace_id,
+        "target_workspace_id": record.target_workspace_id,
+        "shared_by": record.shared_by,
+    }
 
 # 2019-03-18T11:10:18 update
 
