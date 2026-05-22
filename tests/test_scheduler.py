@@ -1,5 +1,4 @@
-import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import ScheduledJobRegistry, TaskScheduler
 
 
 class TestTaskScheduler:
@@ -35,6 +34,110 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_overlapping_releases_do_not_duplicate_scheduled_job(self):
+        now = [100.0]
+        registry = ScheduledJobRegistry()
+        old_scheduler = TaskScheduler(
+            release_id="release-old",
+            scheduled_job_registry=registry,
+            clock=lambda: now[0],
+        )
+        new_scheduler = TaskScheduler(
+            release_id="release-new",
+            scheduled_job_registry=registry,
+            clock=lambda: now[0],
+        )
+
+        old_id = old_scheduler.schedule(
+            {"type": "billing-rollup"},
+            delay=0,
+            job_key="cron:billing-rollup",
+        )
+        new_id = new_scheduler.schedule(
+            {"type": "billing-rollup"},
+            delay=0,
+            job_key="cron:billing-rollup",
+        )
+
+        import asyncio
+        old_task = asyncio.run(old_scheduler.dequeue())
+        new_task = asyncio.run(new_scheduler.dequeue())
+
+        assert new_id == old_id
+        assert old_task["id"] == old_id
+        assert new_task is None
+
+        decisions = registry.leadership_events()
+        assert {
+            "decision": "duplicate_scheduled_job_deferred",
+            "job_key": "cron:billing-rollup",
+            "release_id": "release-new",
+            "leader_release_id": "release-old",
+            "task_id": old_id,
+        } in decisions
+
+    def test_new_release_takes_leadership_after_old_scheduler_lease_expires(
+        self,
+    ):
+        now = [100.0]
+        registry = ScheduledJobRegistry()
+        old_scheduler = TaskScheduler(
+            release_id="release-old",
+            scheduled_job_registry=registry,
+            leadership_ttl=10,
+            clock=lambda: now[0],
+        )
+        new_scheduler = TaskScheduler(
+            release_id="release-new",
+            scheduled_job_registry=registry,
+            leadership_ttl=10,
+            clock=lambda: now[0],
+        )
+
+        old_id = old_scheduler.schedule(
+            {"type": "maintenance"},
+            delay=0,
+            job_key="cron:maintenance",
+        )
+        now[0] = 111.0
+        new_id = new_scheduler.schedule(
+            {"type": "maintenance"},
+            delay=0,
+            job_key="cron:maintenance",
+        )
+
+        import asyncio
+        stale_old_task = asyncio.run(old_scheduler.dequeue())
+        current_new_task = asyncio.run(new_scheduler.dequeue())
+
+        assert old_id != new_id
+        assert stale_old_task is None
+        assert current_new_task["id"] == new_id
+
+        decisions = registry.leadership_events()
+        assert {
+            "decision": "scheduler_leadership_changed",
+            "job_key": "cron:maintenance",
+            "release_id": "release-new",
+            "task_id": new_id,
+            "previous_release_id": "release-old",
+        } in decisions
+        assert any(
+            event["decision"] == "scheduled_job_execution_deferred"
+            and event["release_id"] == "release-old"
+            and event["leader_release_id"] == "release-new"
+            for event in decisions
+        )
+
+    def test_scheduled_task_without_shared_registry_still_runs(self):
+        task_id = self.scheduler.schedule({"type": "one-shot"}, delay=0)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert task["type"] == "one-shot"
 
 # 2019-01-09T19:07:03 update
 

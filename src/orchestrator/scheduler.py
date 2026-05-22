@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+from threading import RLock
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 
@@ -30,14 +30,127 @@ class PriorityQueue:
         return len(self._queue)
 
 
-class TaskScheduler:
+class ScheduledJobRegistry:
+    """Shared cron-job leadership and execution registry."""
+
     def __init__(self):
+        self._lock = RLock()
+        self._leases: Dict[str, Dict[str, Any]] = {}
+        self._executions: set[Tuple[str, str]] = set()
+        self._events: List[Dict[str, Any]] = []
+
+    def register(
+        self,
+        job_key: str,
+        release_id: str,
+        task_id: str,
+        run_at: float,
+        now: float,
+        lease_ttl: float,
+    ) -> Tuple[bool, str, Dict[str, Any]]:
+        with self._lock:
+            lease = self._leases.get(job_key)
+            if lease and lease["expires_at"] > now:
+                event = {
+                    "decision": "duplicate_scheduled_job_deferred",
+                    "job_key": job_key,
+                    "release_id": release_id,
+                    "leader_release_id": lease["release_id"],
+                    "task_id": lease["task_id"],
+                }
+                self._events.append(event)
+                return False, lease["task_id"], event
+
+            event = {
+                "decision": "scheduler_leadership_acquired",
+                "job_key": job_key,
+                "release_id": release_id,
+                "task_id": task_id,
+            }
+            if lease:
+                event["decision"] = "scheduler_leadership_changed"
+                event["previous_release_id"] = lease["release_id"]
+
+            self._leases[job_key] = {
+                "release_id": release_id,
+                "task_id": task_id,
+                "run_at": run_at,
+                "expires_at": now + lease_ttl,
+            }
+            self._events.append(event)
+            return True, task_id, event
+
+    def claim_execution(
+        self,
+        job_key: str,
+        release_id: str,
+        task_id: str,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        with self._lock:
+            lease = self._leases.get(job_key)
+            if not lease or lease["task_id"] != task_id:
+                event = {
+                    "decision": "scheduled_job_execution_deferred",
+                    "job_key": job_key,
+                    "release_id": release_id,
+                    "task_id": task_id,
+                }
+                if lease:
+                    event["leader_release_id"] = lease["release_id"]
+                    event["leader_task_id"] = lease["task_id"]
+                self._events.append(event)
+                return False, event
+
+            execution_key = (job_key, task_id)
+            if execution_key in self._executions:
+                event = {
+                    "decision": "duplicate_scheduled_execution_deferred",
+                    "job_key": job_key,
+                    "release_id": release_id,
+                    "task_id": task_id,
+                }
+                self._events.append(event)
+                return False, event
+
+            self._executions.add(execution_key)
+            event = {
+                "decision": "scheduled_job_execution_claimed",
+                "job_key": job_key,
+                "release_id": release_id,
+                "task_id": task_id,
+            }
+            self._events.append(event)
+            return True, event
+
+    def leadership_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dict(event) for event in self._events]
+
+
+class TaskScheduler:
+    def __init__(
+        self,
+        release_id: str = "local",
+        scheduled_job_registry: Optional[ScheduledJobRegistry] = None,
+        leadership_ttl: float = 30.0,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.release_id = release_id
+        self._scheduled_job_registry = scheduled_job_registry
+        self._leadership_ttl = leadership_ttl
+        self._clock = clock
+        self._leadership_events: List[Dict[str, Any]] = []
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,19 +161,68 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+        job_key: Optional[str] = None,
+    ) -> str:
         task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        run_at = self._clock() + delay
+        scheduled_task = dict(task)
+        scheduled_task["id"] = task_id
+        scheduled_task["scheduled_at"] = self._clock()
+        scheduled_task["retries"] = scheduled_task.get("retries", 0)
+
+        if job_key and self._scheduled_job_registry:
+            (
+                accepted,
+                existing_id,
+                event,
+            ) = self._scheduled_job_registry.register(
+                job_key,
+                self.release_id,
+                task_id,
+                run_at,
+                self._clock(),
+                self._leadership_ttl,
+            )
+            self._leadership_events.append(event)
+            if not accepted:
+                return existing_id
+            scheduled_task["scheduled_job_key"] = job_key
+            scheduled_task["release_id"] = self.release_id
+
+        self._scheduled[task_id] = {
+            "task": scheduled_task,
+            "run_at": run_at,
+            "queue": queue,
+            "priority": priority,
+            "job_key": job_key,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._clock()
+        expired = [
+            tid
+            for tid, record in self._scheduled.items()
+            if record["run_at"] <= now and record["queue"] == queue
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            record = self._scheduled.pop(tid)
+            if not self._can_execute_scheduled_record(tid, record):
+                continue
+            task = record["task"]
+            if queue not in self._queues:
+                self._queues[queue] = PriorityQueue()
+            self._queues[queue].push(task, record["priority"])
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -80,6 +242,26 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def leadership_events(self) -> List[Dict[str, Any]]:
+        return [dict(event) for event in self._leadership_events]
+
+    def _can_execute_scheduled_record(
+        self,
+        task_id: str,
+        record: Dict[str, Any],
+    ) -> bool:
+        job_key = record.get("job_key")
+        if not job_key or not self._scheduled_job_registry:
+            return True
+
+        accepted, event = self._scheduled_job_registry.claim_execution(
+            job_key,
+            self.release_id,
+            task_id,
+        )
+        self._leadership_events.append(event)
+        return accepted
 
 # 2019-04-25T08:37:12 update
 
