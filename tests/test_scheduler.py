@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,50 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_defer_task_while_external_dependency_is_unhealthy(self):
+        import asyncio
+        scheduler = TaskScheduler(dependency_retry_delay=0.01)
+        scheduler.set_dependency_health("billing-api", False)
+        task_id = scheduler.enqueue({
+            "type": "sync-account",
+            "payload": {"private": "not audited"},
+            "external_dependencies": ["billing-api"],
+        })
+
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is None
+        assert task_id not in scheduler._in_flight
+        assert task_id in scheduler._scheduled
+        records = scheduler.audit_records()
+        assert records == [{
+            "decision": "deferred",
+            "reason": "dependency_unhealthy",
+            "task_id": task_id,
+            "queue": "default",
+            "dependencies": ["billing-api"],
+        }]
+        assert "payload" not in records[0]
+
+    def test_dependency_recovery_allows_deferred_task_to_dispatch(self):
+        import asyncio
+        import time
+        scheduler = TaskScheduler(dependency_retry_delay=0.01)
+        scheduler.set_dependency_health("billing-api", False)
+        task_id = scheduler.enqueue({
+            "type": "sync-account",
+            "external_dependencies": ["billing-api"],
+        })
+        assert asyncio.run(scheduler.dequeue()) is None
+
+        scheduler.set_dependency_health("billing-api", True)
+        time.sleep(0.02)
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task_id in scheduler._in_flight
 
 # 2019-01-09T19:07:03 update
 

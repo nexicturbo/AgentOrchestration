@@ -1,9 +1,8 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -31,40 +30,79 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, dependency_retry_delay: float = 1.0):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._dependency_health: Dict[str, bool] = {}
+        self._dependency_retry_delay = dependency_retry_delay
+        self._audit_records: List[Dict[str, Any]] = []
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("retries", 0)
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["priority"] = priority
+        self._scheduled[task_id] = {
+            "run_at": time.time() + delay,
+            "task": task,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid for tid, item in self._scheduled.items()
+            if item["queue"] == queue and item["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            item = self._scheduled.pop(tid)
+            self.enqueue(
+                item["task"],
+                item["queue"],
+                priority=item.get("priority", 0),
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                unhealthy = self._unhealthy_dependencies(task)
+                if unhealthy:
+                    self._defer_for_unhealthy_dependencies(
+                        task,
+                        queue,
+                        unhealthy,
+                    )
+                    return None
                 self._in_flight[task["id"]] = task
                 return task
         return None
@@ -80,6 +118,48 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def set_dependency_health(self, dependency: str, healthy: bool) -> None:
+        self._dependency_health[dependency] = healthy
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._audit_records]
+
+    def _unhealthy_dependencies(self, task: Dict) -> List[str]:
+        dependencies = task.get("external_dependencies", [])
+        unhealthy = []
+        for dependency in dependencies:
+            if not self._dependency_health.get(dependency, True):
+                unhealthy.append(dependency)
+        return unhealthy
+
+    def _defer_for_unhealthy_dependencies(
+        self,
+        task: Dict,
+        queue: str,
+        unhealthy: List[str],
+    ) -> None:
+        task["deferred_reason"] = "dependency_unhealthy"
+        task["deferred_dependencies"] = sorted(unhealthy)
+        self.schedule(
+            task,
+            self._dependency_retry_delay,
+            queue=queue,
+            priority=task.get("priority", 0),
+        )
+        self._record_audit(
+            {
+                "decision": "deferred",
+                "reason": "dependency_unhealthy",
+                "task_id": task["id"],
+                "queue": queue,
+                "dependencies": sorted(unhealthy),
+            }
+        )
+
+    def _record_audit(self, record: Dict[str, Any]) -> None:
+        self._audit_records.append(record)
+        self._audit_records = self._audit_records[-100:]
 
 # 2019-04-25T08:37:12 update
 
