@@ -1,4 +1,5 @@
-import pytest
+from datetime import datetime, timedelta, timezone
+
 from src.common.metrics import MetricsCollector
 
 
@@ -23,6 +24,28 @@ class TestMetricsCollector:
         snapshot = self.metrics.snapshot()
         assert snapshot["histograms"]["response.time"]["count"] == 2
         assert snapshot["histograms"]["response.time"]["avg"] == 1.0
+
+    def test_snapshot_includes_stable_collection_timestamp(self):
+        before = datetime.now(timezone.utc)
+
+        snapshot = self.metrics.snapshot()
+
+        after = datetime.now(timezone.utc)
+        collected_at = snapshot["collected_at"]
+        parsed = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+
+        assert collected_at.endswith("Z")
+        assert parsed.tzinfo == timezone.utc
+        assert before - timedelta(milliseconds=1) <= parsed <= after
+        assert set(snapshot) == {
+            "collected_at",
+            "counters",
+            "gauges",
+            "histograms",
+        }
+        assert snapshot["counters"] == {}
+        assert snapshot["gauges"] == {}
+        assert snapshot["histograms"] == {}
 
     def test_timer(self):
         self.metrics.start_timer("operation")
