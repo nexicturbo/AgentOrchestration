@@ -2,6 +2,7 @@
 
 import os
 import json
+from numbers import Real
 from typing import Any, Dict, Optional
 
 
@@ -46,6 +47,37 @@ class Config:
 
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
+
+    def get_resource_limits(self, prefix: str = "sandbox"):
+        from src.agent.sandbox import ResourceLimits
+
+        return ResourceLimits(
+            cpu_time=self._get_positive_int(f"{prefix}.cpu_time", 60),
+            memory_mb=self._get_positive_int(f"{prefix}.memory_mb", 512),
+            disk_mb=self._get_positive_int(f"{prefix}.disk_mb", 100),
+        )
+
+    def _get_positive_int(self, key: str, default: int) -> int:
+        value = self.get(key, default)
+        if isinstance(value, bool):
+            raise ValueError(f"{key} must be a positive number")
+
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError(f"{key} must be a positive number")
+            try:
+                value = int(value)
+            except ValueError as exc:
+                raise ValueError(f"{key} must be a positive number") from exc
+
+        if not isinstance(value, Real):
+            raise ValueError(f"{key} must be a positive number")
+        if value <= 0:
+            raise ValueError(f"{key} must be a positive number")
+        if int(value) != value:
+            raise ValueError(f"{key} must be a whole number")
+        return int(value)
 
     def to_dict(self) -> Dict:
         return self._data

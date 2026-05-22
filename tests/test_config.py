@@ -1,5 +1,6 @@
 import pytest
 from src.common.config import Config
+from src.agent.sandbox import ResourceLimits
 
 
 class TestConfig:
@@ -31,6 +32,47 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_get_resource_limits_from_config(self):
+        config = Config()
+        config.set("sandbox.cpu_time", "30")
+        config.set("sandbox.memory_mb", 256)
+        config.set("sandbox.disk_mb", 64)
+
+        limits = config.get_resource_limits()
+
+        assert limits.cpu_time == 30
+        assert limits.memory_mb == 256
+        assert limits.disk_mb == 64
+
+    @pytest.mark.parametrize(
+        "key,value",
+        [
+            ("sandbox.cpu_time", -1),
+            ("sandbox.memory_mb", 0),
+            ("sandbox.disk_mb", "not-a-number"),
+            ("sandbox.disk_mb", True),
+        ],
+    )
+    def test_get_resource_limits_rejects_invalid_config(self, key, value):
+        config = Config()
+        config.set(key, value)
+
+        with pytest.raises(ValueError, match="must be a positive number"):
+            config.get_resource_limits()
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"cpu_time": -1},
+            {"memory_mb": 0},
+            {"disk_mb": "100"},
+            {"disk_mb": False},
+        ],
+    )
+    def test_resource_limits_rejects_invalid_values(self, kwargs):
+        with pytest.raises(ValueError):
+            ResourceLimits(**kwargs)
 
 # 2019-02-01T18:58:35 update
 
