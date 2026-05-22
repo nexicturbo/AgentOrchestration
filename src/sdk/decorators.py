@@ -2,12 +2,13 @@
 
 import functools
 import asyncio
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Optional
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     """Decorator for marking a method as an agent task handler."""
     def decorator(func: Callable) -> Callable:
+        is_coroutine = asyncio.iscoroutinefunction(func)
         func.__task_config__ = {
             "name": name or func.__name__,
             "retries": retries,
@@ -17,14 +18,21 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             try:
-                result = await asyncio.wait_for(
-                    func(*args, **kwargs),
-                    timeout=timeout,
-                )
-                return result
+                if is_coroutine:
+                    call = func(*args, **kwargs)
+                else:
+                    loop = asyncio.get_running_loop()
+                    call = loop.run_in_executor(
+                        None,
+                        functools.partial(func, *args, **kwargs),
+                    )
+                return await asyncio.wait_for(call, timeout=timeout)
             except asyncio.TimeoutError:
-                raise TimeoutError(f"Task {name or func.__name__} timed out after {timeout}s")
+                raise TimeoutError(
+                    f"Task {name or func.__name__} timed out after {timeout}s"
+                )
 
+        wrapper.__task_config__ = dict(func.__task_config__)
         return wrapper
     return decorator
 
