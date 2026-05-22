@@ -9,7 +9,12 @@ logger = logging.getLogger(__name__)
 
 
 class BaseAgent(ABC):
-    def __init__(self, agent_id: str, name: str, config: Optional[Dict] = None):
+    def __init__(
+        self,
+        agent_id: str,
+        name: str,
+        config: Optional[Dict] = None,
+    ):
         self.agent_id = agent_id
         self.name = name
         self.config = config or {}
@@ -45,10 +50,21 @@ class BaseAgent(ABC):
         self._running = False
 
     def set_metadata(self, key: str, value: Any) -> None:
-        self._metadata[key] = value
+        normalized_key = self._normalize_metadata_key(key)
+        self._metadata[normalized_key] = value
 
     def get_metadata(self, key: str, default: Any = None) -> Any:
-        return self._metadata.get(key, default)
+        normalized_key = self._normalize_metadata_key(key)
+        return self._metadata.get(normalized_key, default)
+
+    @staticmethod
+    def _normalize_metadata_key(key: str) -> str:
+        if not isinstance(key, str):
+            raise ValueError("metadata key must be a non-empty string")
+        normalized_key = key.strip()
+        if not normalized_key:
+            raise ValueError("metadata key must be a non-empty string")
+        return normalized_key
 
 # 2019-04-19T17:53:22 update
 
