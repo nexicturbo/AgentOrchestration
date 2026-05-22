@@ -1,8 +1,14 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
+import time
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -14,12 +20,22 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        artifact_retention_policy: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.artifact_retention_policy = dict(
+            artifact_retention_policy or {}
+        )
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -30,9 +46,12 @@ class Workflow:
         self.id = str(uuid4())
         self.name = name
         self.description = description
+        self.created_at = time.time()
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.cleanup_schedule: List[Dict[str, Any]] = []
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -66,6 +85,10 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        if not self._validate_artifact_retention_policies(workflow):
+            return False
+
+        self._bind_artifact_cleanup_schedule(workflow)
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
@@ -81,6 +104,107 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _validate_artifact_retention_policies(
+        self,
+        workflow: Workflow,
+    ) -> bool:
+        artifact_ids = set()
+        for step in workflow.steps:
+            policy = step.artifact_retention_policy
+            if not policy:
+                continue
+
+            artifact_id = policy.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id.strip():
+                return self._reject_artifact_retention(
+                    workflow,
+                    step,
+                    "missing_artifact_id",
+                )
+            if artifact_id in artifact_ids:
+                return self._reject_artifact_retention(
+                    workflow,
+                    step,
+                    "duplicate_artifact_policy",
+                )
+            artifact_ids.add(artifact_id)
+
+            cleanup_after = policy.get("cleanup_after")
+            if not isinstance(cleanup_after, (int, float)):
+                return self._reject_artifact_retention(
+                    workflow,
+                    step,
+                    "missing_cleanup_deadline",
+                )
+            if cleanup_after <= workflow.created_at:
+                return self._reject_artifact_retention(
+                    workflow,
+                    step,
+                    "stale_cleanup_schedule",
+                )
+            if policy.get("legal_hold") is True:
+                return self._reject_artifact_retention(
+                    workflow,
+                    step,
+                    "legal_hold_cleanup_blocked",
+                )
+
+            retain_until = policy.get("retain_until")
+            if (
+                retain_until is not None
+                and (
+                    not isinstance(retain_until, (int, float))
+                    or retain_until > cleanup_after
+                )
+            ):
+                return self._reject_artifact_retention(
+                    workflow,
+                    step,
+                    "retention_exceeds_cleanup_window",
+                )
+        return True
+
+    def _reject_artifact_retention(
+        self,
+        workflow: Workflow,
+        step: WorkflowStep,
+        reason: str,
+    ) -> bool:
+        step.error = "Invalid artifact retention policy"
+        workflow.audit_records.append({
+            "decision": "artifact_retention_rejected",
+            "reason": reason,
+            "workflow_id": workflow.id,
+            "step_id": step.id,
+            "step_name": step.name,
+            "policy_count": _artifact_policy_count(workflow),
+        })
+        metrics.increment("workflow.artifact_retention.rejected")
+        logger.warning(
+            "Rejected workflow artifact cleanup schedule policy"
+        )
+        return False
+
+    def _bind_artifact_cleanup_schedule(self, workflow: Workflow) -> None:
+        workflow.cleanup_schedule = []
+        for step in workflow.steps:
+            policy = step.artifact_retention_policy
+            if not policy:
+                continue
+            workflow.cleanup_schedule.append({
+                "workflow_id": workflow.id,
+                "step_id": step.id,
+                "step_name": step.name,
+                "artifact_id": policy["artifact_id"],
+                "cleanup_after": policy["cleanup_after"],
+            })
+
+
+def _artifact_policy_count(workflow: Workflow) -> int:
+    return sum(
+        1 for step in workflow.steps if step.artifact_retention_policy
+    )
 
 # 2019-03-27T19:58:07 update
 
