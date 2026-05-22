@@ -1,8 +1,21 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
+SENSITIVE_INPUT_MARKERS = (
+    "auth",
+    "credential",
+    "key",
+    "password",
+    "secret",
+    "token",
+)
 
 
 class StepStatus(Enum):
@@ -14,12 +27,22 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        inputs: Optional[Dict[str, Any]] = None,
+        input_schema: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.inputs = dict(inputs or {})
+        self.input_schema = dict(input_schema or {})
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,6 +56,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.audit_records: List[Dict[str, Any]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -66,11 +90,17 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        if not self._validate_sensitive_inputs(workflow):
+            return False
+
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
-                result = step.handler()
+                if step.inputs:
+                    result = step.handler(**step.inputs)
+                else:
+                    result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
@@ -81,6 +111,36 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _validate_sensitive_inputs(self, workflow: Workflow) -> bool:
+        for step in workflow.steps:
+            for input_name in step.inputs:
+                if not _is_sensitive_input_name(input_name):
+                    continue
+                declaration = step.input_schema.get(input_name, {})
+                if declaration.get("sensitive") is True:
+                    continue
+
+                step.error = "Sensitive input declaration required"
+                workflow.audit_records.append({
+                    "decision": "sensitive_input_rejected",
+                    "reason": "missing_sensitive_declaration",
+                    "workflow_id": workflow.id,
+                    "step_id": step.id,
+                    "step_name": step.name,
+                    "input_count": len(step.inputs),
+                })
+                metrics.increment("workflow.sensitive_input.rejected")
+                logger.warning(
+                    "Rejected workflow step with undeclared sensitive input"
+                )
+                return False
+        return True
+
+
+def _is_sensitive_input_name(name: str) -> bool:
+    normalized = name.lower().replace("-", "_")
+    return any(marker in normalized for marker in SENSITIVE_INPUT_MARKERS)
 
 # 2019-03-27T19:58:07 update
 
