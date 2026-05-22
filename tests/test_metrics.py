@@ -1,4 +1,5 @@
-import pytest
+import threading
+
 from src.common.metrics import MetricsCollector
 
 
@@ -30,6 +31,24 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_stop_timer_does_not_reenter_lock(self):
+        self.metrics.start_timer("operation")
+        durations = []
+
+        worker = threading.Thread(
+            target=lambda: durations.append(
+                self.metrics.stop_timer("operation")
+            ),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=0.2)
+
+        assert not worker.is_alive()
+        assert durations[0] >= 0
+        snapshot = self.metrics.snapshot()
+        assert snapshot["histograms"]["operation"]["count"] == 1
 
 # 2019-07-16T09:29:21 update
 
