@@ -110,6 +110,41 @@ def test_valid_delivery_is_idempotent_and_hides_internal_fields(client):
     assert "callback_headers" not in first.text
 
 
+def test_duplicate_delivery_id_rejects_changed_public_event(client):
+    create_subscription(client)
+    original = client.post(
+        "/api/v2/webhooks/deliveries",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "event_type": "task.completed",
+            "delivery_id": "delivery-conflict",
+            "payload": {"result": "ok"},
+        },
+    )
+    conflict = client.post(
+        "/api/v2/webhooks/deliveries",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "event_type": "task.completed",
+            "delivery_id": "delivery-conflict",
+            "payload": {"result": "changed"},
+        },
+    )
+
+    assert original.status_code == 200
+    assert conflict.status_code == 400
+    assert "delivery_id already used" in conflict.json()["detail"]
+
+    retry = client.post(
+        "/api/v2/webhooks/deliveries/delivery-conflict/retry",
+        headers=AUTH_HEADERS,
+        json={"workspace_id": "workspace-a"},
+    )
+    assert retry.json() == original.json()
+
+
 def test_rejected_delivery_does_not_create_records(client):
     create_subscription(client)
 
@@ -200,3 +235,67 @@ def test_delivery_respects_workspace_and_disabled_subscription_scope(client):
         delivery["subscription_id"]
         for delivery in response_b.json()["deliveries"]
     ] == [workspace_b["id"]]
+
+
+def test_rotated_subscription_versions_delivery_idempotency(client):
+    subscription = create_subscription(client)
+    first = client.post(
+        "/api/v2/webhooks/deliveries",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "event_type": "task.completed",
+            "delivery_id": "delivery-rotated",
+            "payload": {"result": "ok"},
+        },
+    )
+    rotated = client.post(
+        f"/api/v2/webhooks/subscriptions/{subscription['id']}/rotate",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "endpoint": "https://hooks.example.com/workspace-a-v2",
+        },
+    )
+    second = client.post(
+        "/api/v2/webhooks/deliveries",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-a",
+            "event_type": "task.completed",
+            "delivery_id": "delivery-rotated",
+            "payload": {"result": "ok"},
+        },
+    )
+
+    assert first.status_code == 200
+    assert rotated.status_code == 200
+    assert (
+        rotated.json()["endpoint"]
+        == "https://hooks.example.com/workspace-a-v2"
+    )
+    assert "_secret_version" not in rotated.text
+
+    assert second.status_code == 200
+    assert second.json()["deliveries"] == [{
+        "delivery_id": "delivery-rotated",
+        "subscription_id": subscription["id"],
+        "workspace_id": "workspace-a",
+        "event_type": "task.completed",
+        "endpoint": "https://hooks.example.com/workspace-a-v2",
+        "status": "delivered",
+        "attempts": 1,
+    }]
+
+    retry = client.post(
+        "/api/v2/webhooks/deliveries/delivery-rotated/retry",
+        headers=AUTH_HEADERS,
+        json={"workspace_id": "workspace-a"},
+    )
+    assert {
+        delivery["endpoint"]
+        for delivery in retry.json()["deliveries"]
+    } == {
+        "https://hooks.example.com/workspace-a",
+        "https://hooks.example.com/workspace-a-v2",
+    }

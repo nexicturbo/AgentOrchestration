@@ -31,6 +31,12 @@ class WebhookSubscriptionCreate(BaseModel):
     enabled: bool = True
 
 
+class WebhookSubscriptionRotate(BaseModel):
+    workspace_id: str
+    endpoint: str
+    enabled: bool = True
+
+
 class WebhookDeliveryCreate(BaseModel):
     workspace_id: str
     event_type: str
@@ -46,7 +52,7 @@ class WebhookRetryRequest(BaseModel):
 class WebhookService:
     def __init__(self):
         self._subscriptions: Dict[str, Dict[str, Any]] = {}
-        self._deliveries: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._deliveries: Dict[Tuple[str, str, str, int], Dict[str, Any]] = {}
 
     def clear(self) -> None:
         self._subscriptions.clear()
@@ -80,6 +86,26 @@ class WebhookService:
             if subscription["workspace_id"] == workspace_id
         ]
 
+    def rotate_subscription(
+        self,
+        subscription_id: str,
+        request: WebhookSubscriptionRotate,
+    ) -> Dict[str, Any]:
+        self._validate_workspace_id(request.workspace_id)
+        self._validate_endpoint(request.endpoint)
+
+        subscription = self._subscriptions.get(subscription_id)
+        if (
+            subscription is None
+            or subscription["workspace_id"] != request.workspace_id
+        ):
+            raise ValueError("webhook subscription not found")
+
+        subscription["endpoint"] = request.endpoint
+        subscription["enabled"] = request.enabled
+        subscription["_secret_version"] += 1
+        return self._public_subscription(subscription)
+
     def deliver(self, request: WebhookDeliveryCreate) -> Dict[str, Any]:
         self._validate_event_type(request.event_type)
         self._validate_workspace_id(request.workspace_id)
@@ -93,11 +119,20 @@ class WebhookService:
                 request.workspace_id,
                 request.delivery_id,
                 subscription["id"],
+                subscription["_secret_version"],
             )
-            if key not in self._deliveries:
+            fingerprint = self._delivery_fingerprint(request)
+            existing = self._deliveries.get(key)
+            if existing is not None:
+                if existing["_idempotency_fingerprint"] != fingerprint:
+                    raise ValueError(
+                        "delivery_id already used for a different event"
+                    )
+            else:
                 self._deliveries[key] = self._build_delivery_record(
                     request,
                     subscription,
+                    fingerprint,
                 )
                 subscription["_delivery_count"] += 1
             deliveries.append(self._public_delivery(self._deliveries[key]))
@@ -146,6 +181,7 @@ class WebhookService:
         self,
         request: WebhookDeliveryCreate,
         subscription: Dict[str, Any],
+        fingerprint: Dict[str, Any],
     ) -> Dict[str, Any]:
         return {
             "delivery_id": request.delivery_id,
@@ -160,6 +196,17 @@ class WebhookService:
             "attempts": 1,
             "_payload": self._public_payload(request.payload),
             "_callback_headers": {"X-Internal-Delivery": request.delivery_id},
+            "_endpoint_version": subscription["_secret_version"],
+            "_idempotency_fingerprint": fingerprint,
+        }
+
+    def _delivery_fingerprint(
+        self,
+        request: WebhookDeliveryCreate,
+    ) -> Dict[str, Any]:
+        return {
+            "event_type": request.event_type,
+            "payload": self._public_payload(request.payload),
         }
 
     def _validated_event_types(self, event_types: List[str]) -> List[str]:
@@ -231,6 +278,17 @@ async def create_subscription(request: WebhookSubscriptionCreate):
 @webhook_router.get("/subscriptions")
 async def list_subscriptions(workspace_id: str):
     return {"subscriptions": webhook_service.list_subscriptions(workspace_id)}
+
+
+@webhook_router.post("/subscriptions/{subscription_id}/rotate")
+async def rotate_subscription(
+    subscription_id: str,
+    request: WebhookSubscriptionRotate,
+):
+    try:
+        return webhook_service.rotate_subscription(subscription_id, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @webhook_router.post("/deliveries")
