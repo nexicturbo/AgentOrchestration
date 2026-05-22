@@ -1,10 +1,15 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
+import logging
 import time
 from typing import Any, Dict, Optional
 from uuid import uuid4
+
+from src.common.metrics import metrics
+
+logger = logging.getLogger(__name__)
+URGENT_PRIORITY_THRESHOLD = 10
 
 
 class PriorityQueue:
@@ -21,6 +26,19 @@ class PriorityQueue:
             return heapq.heappop(self._queue)[2]
         return None
 
+    def pop_matching(self, predicate) -> Optional[Any]:
+        skipped = []
+        selected = None
+        while self._queue:
+            entry = heapq.heappop(self._queue)
+            if predicate(entry[2]):
+                selected = entry[2]
+                break
+            skipped.append(entry)
+        for entry in skipped:
+            heapq.heappush(self._queue, entry)
+        return selected
+
     def peek(self) -> Optional[Any]:
         if self._queue:
             return self._queue[0][2]
@@ -31,16 +49,25 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, priority_class_limits: Optional[Dict[str, int]] = None):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._priority_class_limits = dict(priority_class_limits or {})
+        self.audit_records = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
+        task["priority"] = priority
+        task.setdefault("priority_class", _priority_class_for(priority))
         task["retries"] = 0
 
         if queue not in self._queues:
@@ -48,13 +75,23 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -63,7 +100,12 @@ class TaskScheduler:
                 self.enqueue(task, queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
-            task = self._queues[queue].pop()
+            task = self._queues[queue].pop_matching(
+                self._priority_class_has_capacity
+            )
+            if task is None:
+                self._record_priority_budget_defer(queue)
+                return None
             if task:
                 self._in_flight[task["id"]] = task
                 return task
@@ -80,6 +122,36 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _priority_class_has_capacity(self, task: Dict) -> bool:
+        priority_class = task.get("priority_class", "standard")
+        limit = self._priority_class_limits.get(priority_class)
+        if limit is None:
+            return True
+        if limit <= 0:
+            return False
+        in_flight = sum(
+            1
+            for active in self._in_flight.values()
+            if active.get("priority_class") == priority_class
+        )
+        return in_flight < limit
+
+    def _record_priority_budget_defer(self, queue: str) -> None:
+        self.audit_records.append({
+            "decision": "priority_class_budget_deferred",
+            "reason": "all_ready_tasks_over_budget",
+            "queue": queue,
+            "in_flight_count": len(self._in_flight),
+        })
+        metrics.increment("scheduler.priority_budget.deferred")
+        logger.warning("Deferred scheduler dispatch for priority class budget")
+
+
+def _priority_class_for(priority: int) -> str:
+    if priority >= URGENT_PRIORITY_THRESHOLD:
+        return "urgent"
+    return "standard"
 
 # 2019-04-25T08:37:12 update
 
