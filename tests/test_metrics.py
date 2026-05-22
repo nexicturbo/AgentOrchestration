@@ -45,6 +45,16 @@ class TestMetricsCollector:
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
 
+    def test_snapshot_reports_active_timer_count_without_names(self):
+        self.metrics.start_timer("operation")
+        self.metrics.start_timer("other.operation")
+
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["active_timers"] == 2
+        assert "operation" not in snapshot
+        assert "other.operation" not in snapshot
+
 # 2019-07-16T09:29:21 update
 
 # 2019-09-09T13:35:42 update

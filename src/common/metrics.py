@@ -54,6 +54,7 @@ class MetricsCollector:
                     }
                     for k, v in self._histograms.items()
                 },
+                "active_timers": len(self._timers),
             }
 
 
