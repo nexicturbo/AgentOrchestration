@@ -1,4 +1,3 @@
-import pytest
 from src.common.metrics import MetricsCollector
 
 
@@ -30,6 +29,34 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_reset_clears_all_collector_state(self):
+        self.metrics.increment("requests.total", 3)
+        self.metrics.gauge("memory.usage", 85.5)
+        self.metrics.observe("response.time", 1.5)
+        self.metrics.start_timer("operation")
+
+        self.metrics.reset()
+
+        snapshot = self.metrics.snapshot()
+        assert snapshot == {
+            "counters": {},
+            "gauges": {},
+            "histograms": {},
+        }
+        assert self.metrics.stop_timer("operation") == 0.0
+
+    def test_reset_allows_module_collector_reuse_without_leaking_state(self):
+        self.metrics.increment("run.previous")
+        self.metrics.gauge("run.value", 12.0)
+        self.metrics.reset()
+
+        self.metrics.increment("run.current", 2)
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["counters"] == {"run.current": 2}
+        assert snapshot["gauges"] == {}
+        assert snapshot["histograms"] == {}
 
 # 2019-07-16T09:29:21 update
 
