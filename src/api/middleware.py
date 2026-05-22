@@ -10,9 +10,69 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+class CacheControlMiddleware(BaseHTTPMiddleware):
+    _STATE_ATTR = "_ao_authenticated_json_cache"
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        authenticated = _has_authentication_material(request)
+        setattr(request.state, self._STATE_ATTR, authenticated)
+        try:
+            response = await call_next(request)
+            if authenticated and _is_json_response(response):
+                response.headers["Cache-Control"] = "no-store"
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+                response.headers["Vary"] = _append_vary(
+                    response.headers.get("Vary"),
+                    ["Authorization", "Cookie"],
+                )
+                logger.info("Applied authenticated JSON cache controls")
+            return response
+        finally:
+            if hasattr(request.state, self._STATE_ATTR):
+                delattr(request.state, self._STATE_ATTR)
+
+
+def _has_authentication_material(request: Request) -> bool:
+    token = request.headers.get("Authorization", "")
+    has_bearer = token.startswith("Bearer ")
+    has_session = bool(request.cookies.get("ao_session"))
+    return has_bearer or has_session
+
+
+def _is_json_response(response: Response) -> bool:
+    content_type = response.headers.get("content-type", "")
+    return content_type.startswith("application/json")
+
+
+def _append_vary(current: str, values: list) -> str:
+    existing = []
+    for value in (current or "").split(","):
+        value = value.strip()
+        if value:
+            existing.append(value)
+
+    seen = {value.lower() for value in existing}
+    for value in values:
+        if value.lower() not in seen:
+            existing.append(value)
+            seen.add(value.lower())
+    return ", ".join(existing)
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        is_api_request = request.url.path.startswith("/api/v2")
+        is_token_request = request.url.path == "/api/v2/auth/token"
+        if is_api_request and not is_token_request:
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +86,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +110,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
