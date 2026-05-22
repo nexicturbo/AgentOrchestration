@@ -2,6 +2,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api.server import create_app
+from src.api.webhook_auth import (
+    MANAGE_WEBHOOKS_SCOPE,
+    webhook_auth_guard,
+)
 from src.api.webhooks import webhook_service
 
 
@@ -11,8 +15,22 @@ AUTH_HEADERS = {"Authorization": "Bearer test-token"}
 @pytest.fixture(autouse=True)
 def clear_webhooks():
     webhook_service.clear()
+    webhook_auth_guard.clear()
+    webhook_auth_guard.add_token(
+        "test-token",
+        workspaces={"workspace-a", "workspace-b"},
+        scopes={MANAGE_WEBHOOKS_SCOPE},
+        role="admin",
+    )
+    webhook_auth_guard.add_session(
+        "browser-session",
+        workspaces={"workspace-a"},
+        scopes={MANAGE_WEBHOOKS_SCOPE},
+        role="owner",
+    )
     yield
     webhook_service.clear()
+    webhook_auth_guard.clear()
 
 
 @pytest.fixture()
@@ -60,6 +78,116 @@ def test_subscription_create_rejects_event_type_before_persistence(client):
         params={"workspace_id": "workspace-a"},
     )
     assert response.json() == {"subscriptions": []}
+
+
+@pytest.mark.parametrize(
+    ("token", "status_code"),
+    [
+        ("disabled-token", 403),
+        ("revoked-token", 403),
+        ("expired-token", 401),
+        ("viewer-token", 403),
+        ("missing-scope-token", 403),
+    ],
+)
+def test_webhook_management_rejects_invalid_principals(
+    client,
+    token,
+    status_code,
+):
+    import time
+
+    webhook_auth_guard.add_token(
+        "disabled-token",
+        workspaces={"workspace-a"},
+        scopes={MANAGE_WEBHOOKS_SCOPE},
+        role="admin",
+        disabled=True,
+    )
+    webhook_auth_guard.add_token(
+        "revoked-token",
+        workspaces={"workspace-a"},
+        scopes={MANAGE_WEBHOOKS_SCOPE},
+        role="admin",
+        revoked=True,
+    )
+    webhook_auth_guard.add_token(
+        "expired-token",
+        workspaces={"workspace-a"},
+        scopes={MANAGE_WEBHOOKS_SCOPE},
+        role="admin",
+        expires_at=time.time() - 1,
+    )
+    webhook_auth_guard.add_token(
+        "viewer-token",
+        workspaces={"workspace-a"},
+        scopes={MANAGE_WEBHOOKS_SCOPE},
+        role="viewer",
+    )
+    webhook_auth_guard.add_token(
+        "missing-scope-token",
+        workspaces={"workspace-a"},
+        scopes={"webhook:read"},
+        role="admin",
+    )
+
+    response = client.post(
+        "/api/v2/webhooks/subscriptions",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "workspace_id": "workspace-a",
+            "endpoint": "https://hooks.example.com/workspace-a",
+            "event_types": ["task.completed"],
+        },
+    )
+
+    assert response.status_code == status_code
+    assert webhook_service.list_subscriptions("workspace-a") == []
+
+
+def test_webhook_management_rejects_anonymous_before_mutation(client):
+    response = client.post(
+        "/api/v2/webhooks/subscriptions",
+        json={
+            "workspace_id": "workspace-a",
+            "endpoint": "https://hooks.example.com/workspace-a",
+            "event_types": ["task.completed"],
+        },
+    )
+
+    assert response.status_code == 401
+    assert webhook_service.list_subscriptions("workspace-a") == []
+
+
+def test_webhook_management_rejects_wrong_workspace(client):
+    response = client.post(
+        "/api/v2/webhooks/subscriptions",
+        headers=AUTH_HEADERS,
+        json={
+            "workspace_id": "workspace-c",
+            "endpoint": "https://hooks.example.com/workspace-c",
+            "event_types": ["task.completed"],
+        },
+    )
+
+    assert response.status_code == 403
+    assert webhook_service.list_subscriptions("workspace-c") == []
+
+
+def test_browser_session_can_manage_webhooks(client):
+    client.cookies.set("ao_session", "browser-session")
+
+    response = client.post(
+        "/api/v2/webhooks/subscriptions",
+        json={
+            "workspace_id": "workspace-a",
+            "endpoint": "https://hooks.example.com/workspace-a",
+            "event_types": ["task.completed"],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["workspace_id"] == "workspace-a"
 
 
 def test_valid_delivery_is_idempotent_and_hides_internal_fields(client):

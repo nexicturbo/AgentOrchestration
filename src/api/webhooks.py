@@ -4,8 +4,10 @@ from typing import Any, Dict, List, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, status, Cookie
 from pydantic import BaseModel, Field
+
+from src.api.webhook_auth import webhook_auth_guard
 
 
 ALLOWED_WEBHOOK_EVENTS = frozenset({
@@ -268,7 +270,16 @@ webhook_router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 
 @webhook_router.post("/subscriptions", status_code=status.HTTP_201_CREATED)
-async def create_subscription(request: WebhookSubscriptionCreate):
+async def create_subscription(
+    request: WebhookSubscriptionCreate,
+    authorization: str = Header(default=None),
+    ao_session: str = Cookie(default=None),
+):
+    webhook_auth_guard.require_manage_webhooks(
+        workspace_id=request.workspace_id,
+        authorization=authorization,
+        session_id=ao_session,
+    )
     try:
         return webhook_service.create_subscription(request)
     except ValueError as exc:
@@ -276,7 +287,16 @@ async def create_subscription(request: WebhookSubscriptionCreate):
 
 
 @webhook_router.get("/subscriptions")
-async def list_subscriptions(workspace_id: str):
+async def list_subscriptions(
+    workspace_id: str,
+    authorization: str = Header(default=None),
+    ao_session: str = Cookie(default=None),
+):
+    webhook_auth_guard.require_manage_webhooks(
+        workspace_id=workspace_id,
+        authorization=authorization,
+        session_id=ao_session,
+    )
     return {"subscriptions": webhook_service.list_subscriptions(workspace_id)}
 
 
@@ -284,7 +304,14 @@ async def list_subscriptions(workspace_id: str):
 async def rotate_subscription(
     subscription_id: str,
     request: WebhookSubscriptionRotate,
+    authorization: str = Header(default=None),
+    ao_session: str = Cookie(default=None),
 ):
+    webhook_auth_guard.require_manage_webhooks(
+        workspace_id=request.workspace_id,
+        authorization=authorization,
+        session_id=ao_session,
+    )
     try:
         return webhook_service.rotate_subscription(subscription_id, request)
     except ValueError as exc:
@@ -292,7 +319,16 @@ async def rotate_subscription(
 
 
 @webhook_router.post("/deliveries")
-async def deliver_webhook(request: WebhookDeliveryCreate):
+async def deliver_webhook(
+    request: WebhookDeliveryCreate,
+    authorization: str = Header(default=None),
+    ao_session: str = Cookie(default=None),
+):
+    webhook_auth_guard.require_manage_webhooks(
+        workspace_id=request.workspace_id,
+        authorization=authorization,
+        session_id=ao_session,
+    )
     try:
         return webhook_service.deliver(request)
     except ValueError as exc:
@@ -300,7 +336,17 @@ async def deliver_webhook(request: WebhookDeliveryCreate):
 
 
 @webhook_router.post("/deliveries/{delivery_id}/retry")
-async def retry_webhook(delivery_id: str, request: WebhookRetryRequest):
+async def retry_webhook(
+    delivery_id: str,
+    request: WebhookRetryRequest,
+    authorization: str = Header(default=None),
+    ao_session: str = Cookie(default=None),
+):
+    webhook_auth_guard.require_manage_webhooks(
+        workspace_id=request.workspace_id,
+        authorization=authorization,
+        session_id=ao_session,
+    )
     try:
         return webhook_service.retry(delivery_id, request)
     except ValueError as exc:
