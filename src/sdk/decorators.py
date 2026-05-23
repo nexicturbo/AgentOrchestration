@@ -1,12 +1,27 @@
 """SDK decorators for agent definitions."""
 
-import functools
 import asyncio
-from typing import Any, Callable, Dict, Optional
+import functools
+import math
+from numbers import Real
+from typing import Callable, Optional
+
+
+def _validate_timeout(timeout: Real) -> Real:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, Real)
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("task timeout must be a positive number")
+    return timeout
 
 
 def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
     """Decorator for marking a method as an agent task handler."""
+    timeout = _validate_timeout(timeout)
+
     def decorator(func: Callable) -> Callable:
         func.__task_config__ = {
             "name": name or func.__name__,
@@ -23,7 +38,9 @@ def task(name: Optional[str] = None, retries: int = 0, timeout: int = 300):
                 )
                 return result
             except asyncio.TimeoutError:
-                raise TimeoutError(f"Task {name or func.__name__} timed out after {timeout}s")
+                raise TimeoutError(
+                    f"Task {name or func.__name__} timed out after {timeout}s"
+                )
 
         return wrapper
     return decorator
