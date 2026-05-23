@@ -1,10 +1,11 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
+import hashlib
 import json
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 
 class AgentStatus(Enum):
@@ -21,8 +22,21 @@ class AgentRegistry:
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._capability_schema_cache: Dict[str, Dict[str, str]] = {}
+        self._schema_audit_log: List[Dict[str, Any]] = []
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
+        config = config or {}
+        capabilities = self._normalize_capabilities(
+            config.get("capabilities", {})
+        )
+        self._reject_active_contract_conflicts(capabilities)
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,7 +44,7 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
             "created_at": timestamp,
             "updated_at": timestamp,
             "version": "1.0.0",
@@ -40,12 +54,17 @@ class AgentRegistry:
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        self._cache_capabilities(agent_id, capabilities)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -64,6 +83,8 @@ class AgentRegistry:
     def delete(self, agent_id: str) -> bool:
         if agent_id not in self._agents:
             return False
+        capabilities = self._agent_capabilities(self._agents[agent_id])
+        self._invalidate_capabilities(capabilities.keys(), "agent_deleted")
         agent = self._agents.pop(agent_id)
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
@@ -72,6 +93,239 @@ class AgentRegistry:
 
     def count(self) -> int:
         return len(self._agents)
+
+    def update_capabilities(self, agent_id: str, capabilities: Any) -> bool:
+        if agent_id not in self._agents:
+            return False
+
+        normalized = self._normalize_capabilities(capabilities)
+        self._reject_active_contract_conflicts(
+            normalized,
+            exclude_agent_id=agent_id,
+        )
+        agent = self._agents[agent_id]
+        old_capabilities = self._agent_capabilities(agent)
+        affected = set(old_capabilities) | set(normalized)
+
+        agent["config"]["capabilities"] = capabilities
+        agent["updated_at"] = time.time()
+        self._invalidate_capabilities(affected, "capability_contract_changed")
+        self._cache_capabilities(agent_id, normalized)
+        self._audit(
+            "capability_contract_updated",
+            reason="cache_invalidated",
+            agent_id=agent_id,
+            capabilities=sorted(affected),
+        )
+        return True
+
+    def resolve_capability(
+        self,
+        capability: str,
+        expected_schema: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        candidates = [
+            agent for agent in self._agents.values()
+            if self._is_active(agent)
+            and capability in self._agent_capabilities(agent)
+        ]
+        if not candidates:
+            return None
+
+        cached = self._capability_schema_cache.get(capability)
+        if cached is None:
+            agent = candidates[0]
+            contract = self._agent_capabilities(agent)[capability]
+            cached = self._schema_cache_entry(
+                agent["id"],
+                capability,
+                contract,
+            )
+            self._capability_schema_cache[capability] = cached
+
+        if expected_schema is not None:
+            expected_fingerprint = self._fingerprint_schema(expected_schema)
+            if expected_fingerprint != cached["schema_fingerprint"]:
+                self._audit(
+                    "schema_resolution_rejected",
+                    capability=capability,
+                    reason="stale_expected_schema",
+                    expected_fingerprint=expected_fingerprint,
+                    cached_fingerprint=cached["schema_fingerprint"],
+                )
+                raise ValueError(
+                    f"stale schema for capability {capability!r}"
+                )
+
+        for agent in candidates:
+            capabilities = self._agent_capabilities(agent)
+            if (
+                capabilities[capability]["fingerprint"]
+                == cached["fingerprint"]
+            ):
+                return agent
+
+        self._audit(
+            "schema_resolution_rejected",
+            capability=capability,
+            reason="cached_schema_unavailable",
+            cached_fingerprint=cached["fingerprint"],
+        )
+        self._capability_schema_cache.pop(capability, None)
+        return None
+
+    @property
+    def schema_audit_log(self) -> List[Dict[str, Any]]:
+        return list(self._schema_audit_log)
+
+    def _normalize_capabilities(
+        self,
+        capabilities: Any,
+    ) -> Dict[str, Dict[str, Any]]:
+        normalized: Dict[str, Dict[str, Any]] = {}
+        if not capabilities:
+            return normalized
+
+        if isinstance(capabilities, dict):
+            items = []
+            for name, contract in capabilities.items():
+                if isinstance(contract, dict):
+                    items.append({"name": name, **contract})
+                else:
+                    items.append({"name": name, "schema": contract})
+        elif isinstance(capabilities, list):
+            items = capabilities
+        else:
+            raise ValueError("capabilities must be a mapping or list")
+
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("capability entries must be mappings")
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("capability name must be a non-empty string")
+            contract = {
+                "name": name,
+                "version": item.get("version", "1.0"),
+                "schema": item.get("schema", {}),
+                "policy": item.get("policy", {}),
+            }
+            contract["fingerprint"] = self._fingerprint_contract(contract)
+            contract["schema_fingerprint"] = self._fingerprint_schema(
+                contract["schema"]
+            )
+            normalized[name] = contract
+        return normalized
+
+    def _fingerprint_schema(self, schema: Any) -> str:
+        payload = json.dumps(
+            schema,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _fingerprint_contract(self, contract: Dict[str, Any]) -> str:
+        public_contract = {
+            key: contract.get(key)
+            for key in ("name", "version", "schema", "policy")
+            if key in contract
+        }
+        payload = json.dumps(
+            public_contract,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _agent_capabilities(
+        self,
+        agent: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        return self._normalize_capabilities(
+            agent.get("config", {}).get("capabilities", {})
+        )
+
+    def _reject_active_contract_conflicts(
+        self,
+        capabilities: Dict[str, Dict[str, Any]],
+        exclude_agent_id: Optional[str] = None,
+    ) -> None:
+        for capability, contract in capabilities.items():
+            for agent in self._agents.values():
+                if (
+                    agent["id"] == exclude_agent_id
+                    or not self._is_active(agent)
+                ):
+                    continue
+                existing = self._agent_capabilities(agent).get(capability)
+                if (
+                    existing
+                    and existing["fingerprint"] != contract["fingerprint"]
+                ):
+                    self._audit(
+                        "schema_registration_rejected",
+                        capability=capability,
+                        reason="active_contract_conflict",
+                        existing_fingerprint=existing["fingerprint"],
+                        proposed_fingerprint=contract["fingerprint"],
+                        agent_id=agent["id"],
+                    )
+                    raise ValueError(
+                        f"capability {capability!r} already has an active "
+                        "incompatible schema"
+                    )
+
+    def _cache_capabilities(
+        self,
+        agent_id: str,
+        capabilities: Dict[str, Dict[str, Any]],
+    ) -> None:
+        for capability, contract in capabilities.items():
+            self._capability_schema_cache[capability] = (
+                self._schema_cache_entry(agent_id, capability, contract)
+            )
+
+    def _schema_cache_entry(
+        self,
+        agent_id: str,
+        capability: str,
+        contract: Dict[str, Any],
+    ) -> Dict[str, str]:
+        return {
+            "agent_id": agent_id,
+            "capability": capability,
+            "fingerprint": contract["fingerprint"],
+            "schema_fingerprint": contract["schema_fingerprint"],
+        }
+
+    def _invalidate_capabilities(
+        self,
+        capabilities: Set[str],
+        reason: str,
+    ) -> None:
+        for capability in capabilities:
+            if self._capability_schema_cache.pop(capability, None):
+                self._audit(
+                    "schema_cache_invalidated",
+                    capability=capability,
+                    reason=reason,
+                )
+
+    def _is_active(self, agent: Dict[str, Any]) -> bool:
+        return agent["status"] in {
+            AgentStatus.PENDING.value,
+            AgentStatus.RUNNING.value,
+            AgentStatus.PAUSED.value,
+        }
+
+    def _audit(self, action: str, **fields: Any) -> None:
+        record = {
+            "action": action,
+            "timestamp": time.time(),
+        }
+        record.update(fields)
+        self._schema_audit_log.append(record)
 
 # 2019-01-29T11:24:49 update
 

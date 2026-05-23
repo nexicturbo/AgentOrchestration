@@ -48,6 +48,87 @@ class TestAgentRegistry:
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
 
+    def test_rejects_active_conflicting_capability_contract(self):
+        agent_id = self.registry.register(
+            "summarizer-v1",
+            "worker.processor",
+            {
+                "capabilities": {
+                    "summarize": {
+                        "schema": {"required": ["text"]},
+                    },
+                },
+            },
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        with pytest.raises(ValueError, match="incompatible schema"):
+            self.registry.register(
+                "summarizer-v2",
+                "worker.processor",
+                {
+                    "capabilities": {
+                        "summarize": {
+                            "schema": {"required": ["text", "locale"]},
+                        },
+                    },
+                },
+            )
+
+        agent = self.registry.get(agent_id)
+        assert self.registry.count() == 1
+        assert agent["status"] == AgentStatus.RUNNING.value
+        assert self.registry.schema_audit_log[-1]["action"] == (
+            "schema_registration_rejected"
+        )
+        assert self.registry.schema_audit_log[-1]["reason"] == (
+            "active_contract_conflict"
+        )
+        assert "schema" not in self.registry.schema_audit_log[-1]
+
+    def test_capability_updates_invalidate_stale_schema_cache(self):
+        old_schema = {"required": ["text"]}
+        new_schema = {"required": ["text", "locale"]}
+        agent_id = self.registry.register(
+            "summarizer",
+            "worker.processor",
+            {
+                "capabilities": {
+                    "summarize": {"schema": old_schema},
+                },
+            },
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+        assert self.registry.resolve_capability(
+            "summarize",
+            expected_schema=old_schema,
+        )["id"] == agent_id
+
+        assert self.registry.update_capabilities(
+            agent_id,
+            {
+                "summarize": {"schema": new_schema},
+            },
+        )
+
+        with pytest.raises(ValueError, match="stale schema"):
+            self.registry.resolve_capability(
+                "summarize",
+                expected_schema=old_schema,
+            )
+
+        resolved = self.registry.resolve_capability(
+            "summarize",
+            expected_schema=new_schema,
+        )
+        assert resolved["id"] == agent_id
+        assert resolved["status"] == AgentStatus.RUNNING.value
+        assert any(
+            record["action"] == "schema_cache_invalidated"
+            and record["capability"] == "summarize"
+            for record in self.registry.schema_audit_log
+        )
+
 # 2019-01-23T10:28:57 update
 
 # 2019-01-28T18:15:57 update
