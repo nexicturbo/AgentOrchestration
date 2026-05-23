@@ -1,4 +1,3 @@
-import pytest
 from src.common.metrics import MetricsCollector
 
 
@@ -21,8 +20,12 @@ class TestMetricsCollector:
         self.metrics.observe("response.time", 0.5)
         self.metrics.observe("response.time", 1.5)
         snapshot = self.metrics.snapshot()
-        assert snapshot["histograms"]["response.time"]["count"] == 2
-        assert snapshot["histograms"]["response.time"]["avg"] == 1.0
+        histogram = snapshot["histograms"]["response.time"]
+        assert histogram["count"] == 2
+        assert histogram["sum"] == 2.0
+        assert histogram["avg"] == 1.0
+        assert histogram["min"] == 0.5
+        assert histogram["max"] == 1.5
 
     def test_timer(self):
         self.metrics.start_timer("operation")
@@ -30,6 +33,17 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_timer_histogram_includes_min_and_max(self):
+        self.metrics.start_timer("operation")
+        import time
+        time.sleep(0.01)
+        duration = self.metrics.stop_timer("operation")
+
+        histogram = self.metrics.snapshot()["histograms"]["operation"]
+        assert histogram["count"] == 1
+        assert histogram["min"] == duration
+        assert histogram["max"] == duration
 
 # 2019-07-16T09:29:21 update
 
