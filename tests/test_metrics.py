@@ -1,5 +1,8 @@
 import pytest
-from src.common.metrics import MetricsCollector
+from src.common.metrics import (
+    DEFAULT_EXPORTER_COUNTER_MAX,
+    MetricsCollector,
+)
 
 
 class TestMetricsCollector:
@@ -30,6 +33,68 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_plain_snapshot_allows_large_python_counters(self):
+        self.metrics.increment(
+            "events.total",
+            DEFAULT_EXPORTER_COUNTER_MAX + 1,
+        )
+
+        snapshot = self.metrics.snapshot()
+
+        assert snapshot["counters"]["events.total"] == (
+            DEFAULT_EXPORTER_COUNTER_MAX + 1
+        )
+
+    def test_exporter_snapshot_accepts_counter_at_range_limit(self):
+        self.metrics.increment("events.total", DEFAULT_EXPORTER_COUNTER_MAX)
+
+        snapshot = self.metrics.snapshot(exporter=True)
+
+        assert snapshot["counters"]["events.total"] == (
+            DEFAULT_EXPORTER_COUNTER_MAX
+        )
+
+    def test_exporter_snapshot_rejects_over_limit_counter(self):
+        self.metrics.increment(
+            "events.total",
+            DEFAULT_EXPORTER_COUNTER_MAX + 1,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="counter exceeds exporter range: events.total",
+        ):
+            self.metrics.snapshot(exporter=True)
+
+    def test_exporter_snapshot_supports_custom_counter_limit(self):
+        self.metrics.increment("events.total", 11)
+
+        with pytest.raises(
+            ValueError,
+            match="counter exceeds exporter range: events.total",
+        ):
+            self.metrics.snapshot(max_counter_value=10)
+
+        snapshot = self.metrics.snapshot(max_counter_value=11)
+        assert snapshot["counters"]["events.total"] == 11
+
+    def test_exporter_counter_limit_can_be_disabled(self):
+        metrics = MetricsCollector(exporter_counter_max=None)
+        metrics.increment("events.total", DEFAULT_EXPORTER_COUNTER_MAX + 1)
+
+        snapshot = metrics.snapshot(exporter=True)
+
+        assert snapshot["counters"]["events.total"] == (
+            DEFAULT_EXPORTER_COUNTER_MAX + 1
+        )
+
+    def test_exporter_counter_limit_rejects_negative_configuration(self):
+        with pytest.raises(ValueError, match="exporter counter max"):
+            MetricsCollector(exporter_counter_max=-1)
+
+        with pytest.raises(ValueError, match="max counter value"):
+            self.metrics.snapshot(max_counter_value=-1)
 
 # 2019-07-16T09:29:21 update
 
