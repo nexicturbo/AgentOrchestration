@@ -1,31 +1,62 @@
 """CLI entry point for the agent orchestrator."""
 
 import argparse
+from pathlib import Path
 import sys
 
 from src.common.config import Config
 from src.common.logging import configure_logging
 
 
+def normalize_config_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+def load_cli_config(path: str) -> Config:
+    return Config(normalize_config_path(path))
+
+
 def cli():
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
 
     args = parser.parse_args()
 
@@ -33,6 +64,8 @@ def cli():
         configure_logging("DEBUG")
     else:
         configure_logging("INFO")
+
+    config = load_cli_config(args.config) if args.config else Config()
 
     if args.command == "init":
         print(f"Initializing project: {args.name}")
@@ -45,6 +78,8 @@ def cli():
     else:
         parser.print_help()
         sys.exit(1)
+
+    return config
 
 
 if __name__ == "__main__":
