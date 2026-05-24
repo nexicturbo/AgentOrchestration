@@ -2,7 +2,8 @@
 
 import time
 import logging
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Dict, Set
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,12 +11,114 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class AuthPrincipal:
+    subject: str
+    workspace: str
+    role: str
+    scopes: Set[str]
+
+
+class AuthError(ValueError):
+    def __init__(self, message: str, status_code: int = 401):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def parse_bearer_authorization(header: str) -> str:
+    parts = header.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        raise AuthError("Invalid authorization scheme")
+    return parts[1].strip()
+
+
+def parse_principal(token: str) -> AuthPrincipal:
+    fields = _parse_token_fields(token)
+    subject = fields.get("sub", "")
+    role = fields.get("role", "")
+    workspace = fields.get("workspace", "")
+    scopes = {
+        scope.strip()
+        for scope in fields.get("scopes", "").split(",")
+        if scope.strip()
+    }
+
+    if fields.get("revoked", "false").lower() == "true":
+        raise AuthError("Token revoked")
+    if fields.get("stale", "false").lower() == "true":
+        raise AuthError("Token stale")
+    if fields.get("fresh", "true").lower() == "false":
+        raise AuthError("Token stale")
+    if not subject or subject.lower() == "anonymous":
+        raise AuthError("Anonymous principal")
+    if not workspace:
+        raise AuthError("Missing workspace")
+
+    return AuthPrincipal(
+        subject=subject,
+        workspace=workspace,
+        role=role,
+        scopes=scopes,
+    )
+
+
+def validate_principal(principal: AuthPrincipal, request: Request) -> None:
+    mutating = request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
+    required_scope = "agents:write" if mutating else "agents:read"
+    allowed_roles = {"admin", "operator"} if mutating else {
+        "admin",
+        "operator",
+        "viewer",
+    }
+
+    if (
+        required_scope not in principal.scopes
+        and "agents:*" not in principal.scopes
+    ):
+        raise AuthError("Insufficient scope", status_code=403)
+    if principal.role not in allowed_roles:
+        raise AuthError("Insufficient workspace role", status_code=403)
+
+
+def _parse_token_fields(token: str) -> Dict[str, str]:
+    fields: Dict[str, str] = {}
+    for chunk in token.split(";"):
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise AuthError("Malformed bearer token")
+        key, value = chunk.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise AuthError("Malformed bearer token")
+        fields[key] = value.strip()
+    if not fields:
+        raise AuthError("Malformed bearer token")
+    return fields
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
+            try:
+                token = parse_bearer_authorization(
+                    request.headers.get("Authorization", "")
+                )
+                principal = parse_principal(token)
+                validate_principal(principal, request)
+                request.state.principal = principal
+            except AuthError as exc:
+                return Response(
+                    status_code=exc.status_code,
+                    content=str(exc),
+                )
         return await call_next(request)
 
 
@@ -26,14 +129,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +153,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
