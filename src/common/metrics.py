@@ -3,18 +3,20 @@
 import time
 from collections import defaultdict
 from typing import Dict, List
-from threading import Lock
+from threading import RLock
 
 
 class MetricsCollector:
     def __init__(self):
-        self._lock = Lock()
+        self._lock = RLock()
         self._counters: Dict[str, int] = defaultdict(int)
         self._gauges: Dict[str, float] = {}
         self._histograms: Dict[str, List[float]] = defaultdict(list)
         self._timers: Dict[str, float] = {}
 
     def increment(self, metric: str, value: int = 1) -> None:
+        if value < 0:
+            raise ValueError("counter increment value must be non-negative")
         with self._lock:
             self._counters[metric] += value
 
@@ -40,11 +42,20 @@ class MetricsCollector:
 
     def snapshot(self) -> Dict:
         with self._lock:
+            histograms = {}
+            for metric, values in self._histograms.items():
+                total = sum(values)
+                histograms[metric] = {
+                    "count": len(values),
+                    "sum": total,
+                    "avg": total / len(values) if values else 0,
+                    "min": min(values) if values else 0,
+                    "max": max(values) if values else 0,
+                }
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": histograms,
             }
 
 
