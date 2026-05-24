@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,72 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_extend_visibility_preserves_long_running_claim(self):
+        import asyncio
+        self.scheduler.enqueue({"type": "long-running", "payload": {"x": 1}})
+        task = asyncio.run(
+            self.scheduler.dequeue(visibility_timeout=0.01)
+        )
+
+        assert self.scheduler.extend_visibility(task["id"], 30.0)
+        assert self.scheduler.complete(task["id"])
+        assert self.scheduler.visibility_audit_log[-1]["action"] == (
+            "visibility_extended"
+        )
+        assert "payload" not in self.scheduler.visibility_audit_log[-1]
+
+    def test_extend_visibility_is_idempotent_for_duplicate_retry(self):
+        import asyncio
+        self.scheduler.enqueue({"type": "long-running"})
+        task = asyncio.run(
+            self.scheduler.dequeue(visibility_timeout=1.0)
+        )
+
+        assert self.scheduler.extend_visibility(
+            task["id"],
+            30.0,
+            extension_id="heartbeat-1",
+        )
+        deadline = self.scheduler._visibility_deadlines[task["id"]]
+
+        assert self.scheduler.extend_visibility(
+            task["id"],
+            30.0,
+            extension_id="heartbeat-1",
+        )
+
+        assert self.scheduler._visibility_deadlines[task["id"]] == deadline
+        assert self.scheduler.visibility_audit_log[-1]["action"] == (
+            "visibility_extension_duplicate"
+        )
+
+    def test_expired_visibility_requeues_and_rejects_stale_extension(self):
+        import asyncio
+        self.scheduler.enqueue({"type": "long-running"})
+        first = asyncio.run(
+            self.scheduler.dequeue(visibility_timeout=1.0)
+        )
+        self.scheduler._visibility_deadlines[first["id"]] = 0
+
+        assert not self.scheduler.extend_visibility(first["id"], 30.0)
+        assert not self.scheduler.complete(first["id"])
+        redelivered = asyncio.run(
+            self.scheduler.dequeue(visibility_timeout=1.0)
+        )
+
+        assert redelivered["id"] == first["id"]
+        assert any(
+            record["action"] == "visibility_expired_requeued"
+            and record["task_id"] == first["id"]
+            for record in self.scheduler.visibility_audit_log
+        )
+
+    def test_extend_visibility_rejects_missing_task_without_mutation(self):
+        assert not self.scheduler.extend_visibility("missing", 10.0)
+        assert self.scheduler.visibility_audit_log[-1]["reason"] == (
+            "not_in_flight"
+        )
 
 # 2019-01-09T19:07:03 update
 
