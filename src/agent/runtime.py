@@ -5,7 +5,7 @@ import signal
 import subprocess
 import logging
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, List, NamedTuple, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -18,21 +18,80 @@ class RuntimeState(Enum):
     CRASHED = "crashed"
 
 
+class ModelMode(Enum):
+    CHAT = "chat"
+    COMPLETION = "completion"
+    EMBEDDING = "embedding"
+    RERANK = "rerank"
+    TOOLS = "tools"
+
+
+DEFAULT_MODEL_MODE = ModelMode.CHAT
+SUPPORTED_MODEL_MODES = {mode.value for mode in ModelMode}
+
+
+class ModelModeResolution(NamedTuple):
+    requested: Optional[str]
+    resolved: ModelMode
+    fallback_used: bool
+    reason: str
+
+
+def resolve_model_mode(mode: Optional[str]) -> ModelModeResolution:
+    if mode is None:
+        return ModelModeResolution(
+            requested=None,
+            resolved=DEFAULT_MODEL_MODE,
+            fallback_used=True,
+            reason="missing",
+        )
+
+    requested = str(mode)
+    if requested in SUPPORTED_MODEL_MODES:
+        return ModelModeResolution(
+            requested=requested,
+            resolved=ModelMode(requested),
+            fallback_used=False,
+            reason="supported",
+        )
+
+    logger.warning("Unsupported model mode requested; falling back to chat")
+    return ModelModeResolution(
+        requested=requested[:64],
+        resolved=DEFAULT_MODEL_MODE,
+        fallback_used=True,
+        reason="unsupported",
+    )
+
+
 class AgentRuntime:
     def __init__(self):
         self._processes: Dict[str, subprocess.Popen] = {}
         self._states: Dict[str, RuntimeState] = {}
+        self._routing_decisions: Dict[str, List[Dict[str, Optional[str]]]] = {}
 
-    def start(self, agent_id: str, command: list, env: Optional[Dict] = None) -> bool:
-        if agent_id in self._processes and self._processes[agent_id].poll() is None:
+    def start(
+        self,
+        agent_id: str,
+        command: list,
+        env: Optional[Dict] = None,
+    ) -> bool:
+        if (
+            agent_id in self._processes
+            and self._processes[agent_id].poll() is None
+        ):
             logger.warning(f"Agent {agent_id} is already running")
             return False
 
-        self._states[agent_id] = RuntimeState.STARTING
         process_env = os.environ.copy()
         if env:
             process_env.update(env)
         process_env["AO_AGENT_ID"] = agent_id
+        mode_resolution = resolve_model_mode(process_env.get("AO_MODEL_MODE"))
+        process_env["AO_MODEL_MODE"] = mode_resolution.resolved.value
+        self._record_routing_decision(agent_id, mode_resolution)
+
+        self._states[agent_id] = RuntimeState.STARTING
 
         try:
             proc = subprocess.Popen(
@@ -49,6 +108,29 @@ class AgentRuntime:
             self._states[agent_id] = RuntimeState.CRASHED
             logger.error(f"Failed to start agent {agent_id}: {e}")
             return False
+
+    def get_routing_decisions(
+        self,
+        agent_id: str,
+    ) -> List[Dict[str, Optional[str]]]:
+        return [
+            dict(decision)
+            for decision in self._routing_decisions.get(agent_id, [])
+        ]
+
+    def _record_routing_decision(
+        self,
+        agent_id: str,
+        resolution: ModelModeResolution,
+    ) -> None:
+        self._routing_decisions.setdefault(agent_id, []).append(
+            {
+                "requested": resolution.requested,
+                "resolved": resolution.resolved.value,
+                "fallback_used": str(resolution.fallback_used).lower(),
+                "reason": resolution.reason,
+            }
+        )
 
     def stop(self, agent_id: str, timeout: int = 10) -> bool:
         proc = self._processes.get(agent_id)
