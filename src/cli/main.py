@@ -3,52 +3,110 @@
 import argparse
 import sys
 
-from src.common.config import Config
 from src.common.logging import configure_logging
 
 
-def cli():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Agent Orchestrator CLI")
     parser.add_argument("--config", "-c", help="Path to config file")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose output",
+    )
 
-    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+    )
 
-    init_parser = subparsers.add_parser("init", help="Initialize a new project")
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize a new project",
+    )
     init_parser.add_argument("name", help="Project name")
 
     deploy_parser = subparsers.add_parser("deploy", help="Deploy an agent")
     deploy_parser.add_argument("manifest", help="Path to agent manifest file")
 
     status_parser = subparsers.add_parser("status", help="Show agent status")
-    status_parser.add_argument("--watch", "-w", action="store_true", help="Watch mode")
+    status_parser.add_argument(
+        "--watch",
+        "-w",
+        action="store_true",
+        help="Watch mode",
+    )
 
     logs_parser = subparsers.add_parser("logs", help="View agent logs")
     logs_parser.add_argument("agent_id", help="Agent ID")
-    logs_parser.add_argument("--tail", "-t", type=int, default=50, help="Number of lines")
+    logs_parser.add_argument(
+        "--tail",
+        "-t",
+        type=int,
+        default=50,
+        help="Number of lines",
+    )
 
-    args = parser.parse_args()
+    return parser
+
+
+def handle_init(args: argparse.Namespace) -> int:
+    print(f"Initializing project: {args.name}")
+    return 0
+
+
+def deploy_agent(manifest: str, config_path: str = None) -> None:
+    print(f"Deploying agent from manifest: {manifest}")
+
+
+def handle_deploy(args: argparse.Namespace) -> int:
+    try:
+        deploy_agent(args.manifest, config_path=args.config)
+    except (ConnectionError, TimeoutError, OSError) as exc:
+        print(f"Deploy failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def handle_status(args: argparse.Namespace) -> int:
+    print("Checking agent status...")
+    return 0
+
+
+def handle_logs(args: argparse.Namespace) -> int:
+    print(f"Fetching logs for agent: {args.agent_id}")
+    return 0
+
+
+def cli(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
     if args.verbose:
         configure_logging("DEBUG")
     else:
         configure_logging("INFO")
 
-    if args.command == "init":
-        print(f"Initializing project: {args.name}")
-    elif args.command == "deploy":
-        print(f"Deploying agent from manifest: {args.manifest}")
-    elif args.command == "status":
-        print("Checking agent status...")
-    elif args.command == "logs":
-        print(f"Fetching logs for agent: {args.agent_id}")
-    else:
+    handlers = {
+        "init": handle_init,
+        "deploy": handle_deploy,
+        "status": handle_status,
+        "logs": handle_logs,
+    }
+    handler = handlers.get(args.command)
+    if handler is None:
         parser.print_help()
-        sys.exit(1)
+        return 1
+    return handler(args)
+
+
+def main(argv=None) -> int:
+    return cli(argv)
 
 
 if __name__ == "__main__":
-    cli()
+    sys.exit(main())
 
 # 2019-01-03T18:44:00 update
 
