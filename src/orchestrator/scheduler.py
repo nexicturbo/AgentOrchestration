@@ -1,8 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import hashlib
 import heapq
 import time
+from collections import deque
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
@@ -37,7 +38,12 @@ class TaskScheduler:
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +54,23 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -80,6 +96,113 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+
+class ReconciliationScheduler:
+    """Gate periodic reconciliation jobs during cluster startup."""
+
+    def __init__(
+        self,
+        scheduler: TaskScheduler,
+        node_id: str,
+        base_interval: float = 60.0,
+        startup_stagger_window: float = 30.0,
+        now_fn=time.time,
+        max_audit_records: int = 256,
+    ):
+        if base_interval <= 0:
+            raise ValueError("base_interval must be positive")
+        if startup_stagger_window < 0:
+            raise ValueError("startup_stagger_window cannot be negative")
+        if max_audit_records <= 0:
+            raise ValueError("max_audit_records must be positive")
+
+        self.scheduler = scheduler
+        self.node_id = node_id
+        self.base_interval = base_interval
+        self.startup_stagger_window = startup_stagger_window
+        self.now_fn = now_fn
+        self.startup_at = now_fn()
+        self.stagger_offset = self._deterministic_offset(node_id)
+        self._last_reconcile_at: Optional[float] = None
+        self._generation = 0
+        self._audit = deque(maxlen=max_audit_records)
+
+    def request_reconcile(
+        self,
+        task: Optional[Dict] = None,
+        queue: str = "maintenance",
+        priority: int = 0,
+    ) -> Dict[str, Any]:
+        now = self.now_fn()
+        due_at = self._next_due_at()
+        if now < due_at:
+            reason = (
+                "startup_stagger_active"
+                if self._last_reconcile_at is None
+                else "reconcile_interval_active"
+            )
+            return self._record_decision(False, reason, now, due_at)
+
+        self._generation += 1
+        reconcile_task = dict(task or {})
+        reconcile_task.update(
+            {
+                "type": "periodic_reconciliation",
+                "node_id": self.node_id,
+                "generation": self._generation,
+            }
+        )
+        queue_task_id = self.scheduler.enqueue(
+            reconcile_task,
+            queue=queue,
+            priority=priority,
+        )
+        self._last_reconcile_at = now
+        return self._record_decision(
+            True,
+            "accepted",
+            now,
+            self._next_due_at(),
+            queue_task_id,
+        )
+
+    def audit_records(self) -> list:
+        return list(self._audit)
+
+    def _next_due_at(self) -> float:
+        if self._last_reconcile_at is None:
+            return self.startup_at + self.stagger_offset
+        return self._last_reconcile_at + self.base_interval
+
+    def _record_decision(
+        self,
+        accepted: bool,
+        reason: str,
+        now: float,
+        due_at: float,
+        queue_task_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        decision = {
+            "accepted": accepted,
+            "reason": reason,
+            "node_id": self.node_id,
+            "generation": self._generation,
+            "observed_at": now,
+            "due_at": due_at,
+        }
+        if queue_task_id is not None:
+            decision["queue_task_id"] = queue_task_id
+        self._audit.append(decision)
+        return decision
+
+    def _deterministic_offset(self, node_id: str) -> float:
+        if self.startup_stagger_window == 0:
+            return 0.0
+        digest = hashlib.sha256(node_id.encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:8], "big")
+        ratio = bucket / float(2 ** 64 - 1)
+        return ratio * self.startup_stagger_window
 
 # 2019-04-25T08:37:12 update
 
