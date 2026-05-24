@@ -1,9 +1,9 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 
@@ -30,37 +30,78 @@ class PriorityQueue:
         return len(self._queue)
 
 
+@dataclass
+class ScheduledTask:
+    task: Dict[str, Any]
+    ready_at: float
+    queue: str
+    priority: int
+
+
 class TaskScheduler:
-    def __init__(self):
+    def __init__(self, clock: Callable[[], float] = time.time):
+        self._clock = clock
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, ScheduledTask] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["queue"] = queue
+        task["priority"] = priority
+        task["enqueued_at"] = self._clock()
+        task.setdefault("retries", 0)
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
-        task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        now = self._clock()
+        task_id = task.get("id") or str(uuid4())
+        scheduled_task = dict(task)
+        scheduled_task["id"] = task_id
+        scheduled_task["queue"] = queue
+        scheduled_task["priority"] = priority
+        scheduled_task["scheduled_at"] = now
+        scheduled_task["ready_at"] = now + delay
+        scheduled_task.setdefault("retries", 0)
+        self._scheduled[task_id] = ScheduledTask(
+            task=scheduled_task,
+            ready_at=scheduled_task["ready_at"],
+            queue=queue,
+            priority=priority,
+        )
+        self._record_audit(
+            "scheduled_deferred",
+            task_id,
+            queue,
+            priority,
+            "ready_at_in_future",
+        )
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
-        for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        self._promote_ready(queue)
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -80,6 +121,44 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    @property
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit)
+
+    def _promote_ready(self, queue: str) -> None:
+        now = self._clock()
+        ready_task_ids = [
+            task_id for task_id, scheduled in self._scheduled.items()
+            if scheduled.queue == queue and scheduled.ready_at <= now
+        ]
+        for task_id in ready_task_ids:
+            scheduled = self._scheduled.pop(task_id)
+            self.enqueue(scheduled.task, scheduled.queue, scheduled.priority)
+            self._record_audit(
+                "scheduled_promoted",
+                task_id,
+                scheduled.queue,
+                scheduled.priority,
+                "ready_at_reached",
+            )
+
+    def _record_audit(
+        self,
+        event: str,
+        task_id: str,
+        queue: str,
+        priority: int,
+        reason: str,
+    ) -> None:
+        self._audit.append({
+            "event": event,
+            "task_id": task_id,
+            "queue": queue,
+            "priority": priority,
+            "reason": reason,
+            "timestamp": self._clock(),
+        })
 
 # 2019-04-25T08:37:12 update
 
