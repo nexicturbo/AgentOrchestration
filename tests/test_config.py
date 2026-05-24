@@ -1,4 +1,7 @@
 import pytest
+import resource
+
+from src.agent.sandbox import AgentSandbox, ResourceLimits
 from src.common.config import Config
 
 
@@ -31,6 +34,66 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_get_resource_limits_normalizes_numeric_config_values(self):
+        config = Config()
+        config.set("sandbox.resources.cpu_time", "120")
+        config.set("sandbox.resources.memory_mb", "1024")
+        config.set("sandbox.resources.disk_mb", 256)
+
+        assert config.get_resource_limits() == {
+            "cpu_time": 120,
+            "memory_mb": 1024,
+            "disk_mb": 256,
+        }
+
+    @pytest.mark.parametrize("key", ["cpu_time", "memory_mb", "disk_mb"])
+    @pytest.mark.parametrize("value", [-1, 0, "0", "", "abc", True, 1.5])
+    def test_resource_limit_config_rejects_invalid_values(
+        self,
+        key,
+        value,
+    ):
+        config = Config()
+        config.set(f"sandbox.resources.{key}", value)
+
+        with pytest.raises(
+            ValueError,
+            match=f"{key} must be a positive integer",
+        ):
+            config.get_resource_limits()
+
+    @pytest.mark.parametrize("key", ["cpu_time", "memory_mb", "disk_mb"])
+    def test_resource_limits_reject_invalid_direct_values(self, key):
+        kwargs = {"cpu_time": 60, "memory_mb": 512, "disk_mb": 100}
+        kwargs[key] = -1
+
+        with pytest.raises(
+            ValueError,
+            match=f"{key} must be a positive integer",
+        ):
+            ResourceLimits(**kwargs)
+
+    def test_apply_limits_revalidates_mutated_limits_before_system_call(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+
+        def record_setrlimit(limit, value):
+            calls.append((limit, value))
+
+        monkeypatch.setattr(resource, "setrlimit", record_setrlimit)
+        limits = ResourceLimits(cpu_time=60, memory_mb=512, disk_mb=100)
+        limits.memory_mb = -512
+
+        with pytest.raises(
+            ValueError,
+            match="memory_mb must be a positive integer",
+        ):
+            AgentSandbox().apply_limits("agent-1", limits)
+
+        assert calls == []
 
 # 2019-02-01T18:58:35 update
 

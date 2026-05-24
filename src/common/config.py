@@ -6,6 +6,12 @@ from typing import Any, Dict, Optional
 
 
 class Config:
+    RESOURCE_LIMIT_DEFAULTS = {
+        "cpu_time": 60,
+        "memory_mb": 512,
+        "disk_mb": 100,
+    }
+
     def __init__(self, config_path: Optional[str] = None):
         self._data: Dict[str, Any] = {}
         if config_path:
@@ -46,6 +52,43 @@ class Config:
 
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)
+
+    def get_resource_limits(
+        self,
+        prefix: str = "sandbox.resources",
+    ) -> Dict[str, int]:
+        values = {}
+        for key, default in self.RESOURCE_LIMIT_DEFAULTS.items():
+            values[key] = self.get(f"{prefix}.{key}", default)
+        return self.validate_resource_limits(values)
+
+    @classmethod
+    def validate_resource_limits(
+        cls,
+        values: Dict[str, Any],
+    ) -> Dict[str, int]:
+        return {
+            key: cls._coerce_positive_int(key, values.get(key, default))
+            for key, default in cls.RESOURCE_LIMIT_DEFAULTS.items()
+        }
+
+    @staticmethod
+    def _coerce_positive_int(name: str, value: Any) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a positive integer")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError(f"{name} must be a positive integer")
+            try:
+                value = int(value, 10)
+            except ValueError as exc:
+                raise ValueError(f"{name} must be a positive integer") from exc
+        elif not isinstance(value, int):
+            raise ValueError(f"{name} must be a positive integer")
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
 
     def to_dict(self) -> Dict:
         return self._data
