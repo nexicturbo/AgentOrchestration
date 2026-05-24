@@ -1,5 +1,8 @@
 import pytest
+import json
+
 from src.common.config import Config
+from src.common.errors import ConfigurationError
 
 
 class TestConfig:
@@ -9,6 +12,20 @@ class TestConfig:
         config = Config(str(config_file))
         assert config.get("app.name") == "test"
         assert config.get("app.port") == 8080
+
+    def test_malformed_json_reports_path_line_and_column(self, tmp_path):
+        config_file = tmp_path / "broken.json"
+        config_file.write_text('{"app": {\n  "name": "test",\n}}')
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            Config(str(config_file))
+
+        message = str(exc_info.value)
+        assert str(config_file) in message
+        assert "line 3" in message
+        assert "column 1" in message
+        assert "Expecting property name enclosed in double quotes" in message
+        assert isinstance(exc_info.value.__cause__, json.JSONDecodeError)
 
     def test_default_value(self):
         config = Config()

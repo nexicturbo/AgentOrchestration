@@ -4,6 +4,8 @@ import os
 import json
 from typing import Any, Dict, Optional
 
+from src.common.errors import ConfigurationError
+
 
 class Config:
     def __init__(self, config_path: Optional[str] = None):
@@ -13,8 +15,14 @@ class Config:
         self._load_env_overrides()
 
     def load(self, path: str) -> None:
-        with open(path) as f:
-            self._data = json.load(f)
+        try:
+            with open(path) as f:
+                self._data = json.load(f)
+        except json.JSONDecodeError as exc:
+            raise ConfigurationError(
+                f"Failed to parse {path} at line {exc.lineno}, "
+                f"column {exc.colno}: {exc.msg}"
+            ) from exc
 
     def _load_env_overrides(self) -> None:
         prefix = "AO_"
