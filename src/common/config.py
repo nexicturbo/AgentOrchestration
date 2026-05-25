@@ -20,8 +20,37 @@ class Config:
         prefix = "AO_"
         for key, value in os.environ.items():
             if key.startswith(prefix):
-                config_key = key[len(prefix):].lower().replace("_", ".")
+                config_key = self._env_key_to_config_key(key[len(prefix):])
                 self._set_nested(config_key, value)
+
+    def _env_key_to_config_key(self, key: str) -> str:
+        normalized = key.lower()
+        if "__" in normalized:
+            marker = "\0"
+            return (
+                normalized.replace("__", marker)
+                .replace("_", ".")
+                .replace(marker, "_")
+            )
+
+        parts = normalized.split("_")
+        return self._resolve_env_key_parts(parts, self._data)
+
+    def _resolve_env_key_parts(self, parts: list[str], current: Any) -> str:
+        if not isinstance(current, dict):
+            return ".".join(parts)
+
+        for end in range(len(parts), 0, -1):
+            candidate = "_".join(parts[:end])
+            if candidate in current:
+                if end == len(parts):
+                    return candidate
+                resolved = self._resolve_env_key_parts(
+                    parts[end:], current[candidate]
+                )
+                return f"{candidate}.{resolved}"
+
+        return ".".join(parts)
 
     def _set_nested(self, key: str, value: Any) -> None:
         parts = key.split(".")

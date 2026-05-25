@@ -1,4 +1,3 @@
-import pytest
 from src.common.config import Config
 
 
@@ -31,6 +30,42 @@ class TestConfig:
         data = config.to_dict()
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
+
+    def test_env_override_preserves_existing_literal_underscore_key(
+        self, tmp_path, monkeypatch
+    ):
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"api_url": "https://old.example"}')
+        monkeypatch.setenv("AO_API_URL", "https://new.example")
+
+        config = Config(str(config_file))
+
+        assert config.get("api_url") == "https://new.example"
+        assert config.get("api.url") is None
+
+    def test_nested_env_override_preserves_existing_literal_underscore_key(
+        self, tmp_path, monkeypatch
+    ):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(
+            '{"service": {"api_url": "https://old.example"}}'
+        )
+        monkeypatch.setenv("AO_SERVICE_API_URL", "https://new.example")
+
+        config = Config(str(config_file))
+
+        assert config.get("service.api_url") == "https://new.example"
+        assert config.get("service.api.url") is None
+
+    def test_env_override_supports_explicit_literal_underscore_escape(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AO_API__URL", "https://new.example")
+
+        config = Config()
+
+        assert config.get("api_url") == "https://new.example"
+        assert config.get("api.url") is None
 
 # 2019-02-01T18:58:35 update
 
